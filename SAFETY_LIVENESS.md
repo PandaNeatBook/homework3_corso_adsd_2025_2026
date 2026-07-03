@@ -1,4 +1,4 @@
-﻿# Proprietà di Safety e Liveness: KV Store con Retry Idempotenti
+# Proprietà di Safety e Liveness: KV Store con Retry Idempotenti
 
 Questo documento formalizza le proprietà di correttezza garantite dal protocollo
 descritto in `api-contract.md`. Per ogni proprietà viene indicata la motivazione
@@ -174,6 +174,48 @@ violazione del protocollo lato client, non un difetto del server.
 
 ---
 
+### L4 — L'idempotenza non sopravvive al failover Primary→Secondary
+
+**Proprietà (limite dichiarato).** Se il Primary crasha e il Secondary si
+promuove a nuovo Primary, la request table del nuovo Primary è **vuota**.
+Un retry inviato dal client al nuovo Primary viene trattato come prima
+esecuzione, con rischio di doppio effetto.
+
+**Perché accade.** La request table è mantenuta esclusivamente in memoria
+locale del nodo che riceve la richiesta. Il meccanismo di replicazione
+trasferisce al Secondary solo gli effetti applicati allo store (le coppie
+chiave/valore), ma non le voci della request table. Il Secondary non ha
+modo di sapere quali `(client_id, seq)` il Primary aveva già elaborato.
+
+Questo implica che la sequenza:
+
+```
+1. Client invia  SET_REQ clientA:42 corso val  → Primary risponde OK v=3
+2. La risposta va persa (timeout / disconnessione)
+3. Primary crasha → Secondary si promuove a Primary
+4. Client fa retry: SET_REQ clientA:42 corso val
+5. Nuovo Primary non ha la request table → applica l'effetto di nuovo
+                                            → DOPPIO EFFETTO ❌
+```
+
+non è prevenuta dall'implementazione corrente.
+
+**Cosa servirebbe per garantirla.** Eliminare questa limitazione richiederebbe:
+
+1. **Replicare la request table**: ogni voce `(client_id, seq) → (payload, risposta)`
+   deve essere propagata al Secondary insieme all'effetto sullo store;
+2. **Replicazione sincrona**: il Primary deve rispondere `OK` al client solo dopo
+   che il Secondary ha confermato di aver persistito sia l'effetto che la voce
+   nella request table. La replicazione asincrona non è sufficiente perché
+   lascia aperta la stessa finestra di rischio.
+
+Queste estensioni non fanno parte del contratto corrente e non sono
+implementate. Questo limite è coerente con la sezione *"Cosa non è garantito"*
+del file `api-contract.md` che dichiara: *"Nessuna replica della request
+table su altri nodi."*
+
+---
+
 ## Tabella riassuntiva
 
 | Proprietà | Garantita | Condizione |
@@ -188,3 +230,4 @@ violazione del protocollo lato client, non un difetto del server.
 | Sopravvivenza al riavvio | No | Request table solo in memoria |
 | Garanzia dopo seq evictato (S1) | No | Fuori dalla sliding window |
 | Ordinamento globale tra client | No | Design single-node |
+| Idempotenza dopo failover Primary→Secondary (L4) | No | Request table non replicata sul Secondary |
