@@ -1,52 +1,47 @@
 # Contratto del Protocollo: KV Store con Retry Idempotenti
 
-Questa versione estende il protocollo del KV store versionato con
-compare-and-set introducendo l'idempotenza delle operazioni mutative.
+Questo documento definisce l'interfaccia pubblica e la semantica osservabile del progetto **KV Store con retry idempotenti tramite `request_id`**.
 
-Il problema che si vuole risolvere e' il seguente: un client puo' inviare
-una scrittura, perdere la risposta (per timeout, disconnessione o crash
-del proprio thread di rete) e non sapere se il server l'abbia gia' applicata.
-Se il client ritenta alla cieca, rischia di applicare due volte lo stesso
-effetto su uno stato che nel frattempo potrebbe essere cambiato.
+Il problema affrontato è il seguente: un client può inviare una richiesta mutativa, perdere la risposta e non sapere se il server l'abbia già applicata. Un retry cieco può quindi produrre due volte lo stesso effetto.
 
-La soluzione e' che il client accompagni ogni operazione mutativa con un
-identificatore univoco di richiesta (`request_id`). Il server tiene traccia
-delle risposte gia' calcolate e, in caso di retry, restituisce la risposta
-memorizzata senza riapplicare l'effetto.
+La soluzione è associare ogni operazione mutativa a un identificatore univoco:
 
-> Nota: la garanzia di idempotenza e' valida solo per la durata della sessione
-> del server. La request table e' mantenuta esclusivamente in memoria; un
-> riavvio del server azzera la tabella e le garanzie non sopravvivono.
+```text
+<client_id>:<seq>
+```
+
+Il server mantiene una request table in memoria e, in caso di retry, restituisce la risposta già calcolata senza riapplicare l'effetto.
 
 ---
 
-## Trasporto
+## 1. Trasporto
 
 - Protocollo testuale su TCP.
 - Encoding UTF-8.
 - Una richiesta per riga, terminata da `\n`.
 - Una risposta per riga, terminata da `\n`.
-- Ogni connessione e' gestita da un thread dedicato.
+- Ogni connessione client è gestita da un thread dedicato.
+- Host e porta di default:
+
+```text
+127.0.0.1:6379
+```
 
 ---
 
-## Modello dati
+## 2. Modello dati
 
 - Chiavi: stringhe senza spazi.
-- Valori: stringhe UTF-8 senza newline, ma con spazi ammessi.
-- Ogni chiave ha un valore e una versione intera associata.
+- Valori: stringhe UTF-8 senza newline; gli spazi sono ammessi.
+- Ogni chiave ha una versione intera locale.
 - Una chiave assente ha versione implicita `-1`.
-- La versione parte da `0` al primo inserimento e cresce di `1` ad ogni
-  scrittura effettiva.
-- `DELETE_REQ` cancella il valore e azzera la storia di versione della
-  chiave: un successivo `SET_REQ` sulla stessa chiave reinizia da `version=0`.
+- Il primo inserimento produce `version=0`.
+- Ogni scrittura effettiva successiva incrementa la versione di `1`.
+- `DELETE_REQ` rimuove la chiave; un successivo `SET_REQ` riparte da `version=0`.
 
 ---
 
-## Formato del `request_id`
-
-Il `request_id` identifica univocamente una singola operazione mutativa
-emessa da un client specifico.
+## 3. Formato del request_id
 
 Formato:
 
@@ -56,397 +51,274 @@ Formato:
 
 Dove:
 
-- `client_id` e' una stringa senza spazi e senza due punti `:`, che
-  identifica il client (ad esempio `clientA`, `worker-3`, `node1`);
-- `seq` e' un numero intero non negativo, strettamente crescente per ogni
-  nuova operazione logica dello stesso client; lo stesso `seq` puo'
-  ricomparire solo come retry identico della stessa richiesta.
+- `client_id` è una stringa non vuota, senza spazi e senza `:`;
+- `seq` è un intero non negativo;
+- per ogni nuova operazione logica dello stesso client, `seq` dovrebbe crescere monotonicamente;
+- lo stesso `seq` può ricomparire solo come retry identico della stessa richiesta.
 
 Esempi validi:
 
 ```text
+clientA:0
 clientA:42
-worker-3:0
-node1:7
+worker-3:7
 ```
 
----
-
-## Contenuto della request table
-
-Per ogni `(client_id, seq)` gia' visto, il server memorizza due informazioni:
-
-1. **il payload canonico della richiesta**: il testo del comando senza il
-   `request_id`, con normalizzazione selettiva. Il nome del comando viene
-   portato in maiuscolo; i token strutturali (chiave, versione attesa per
-   `CAS_REQ`) vengono estratti invariati; **il valore e' preservato
-   esattamente come ricevuto**, escluso il solo newline finale. Questo
-   garantisce che `hello   world` e `hello world` restino distinti.
-   Serve a rilevare conflitti tra richieste con stesso `request_id` ma
-   operazione diversa.
-2. **la risposta calcolata**: la stringa di risposta prodotta la prima volta,
-   compresi gli esiti di errore (ad esempio `ERR version_mismatch current=0`).
-   Anche gli errori applicativi vengono memorizzati e riprodotti identici
-   al retry successivo.
-
-Esempio di voce nella tabella:
+Esempi non validi:
 
 ```text
-client_id = "clientA"
-seq       = 42
-payload   = "SET_REQ key1 hello"
-response  = "OK version=3"
+clientA
+clientA:-1
+client A:0
+client:A:0
 ```
 
 ---
 
-## Comportamento al retry
+## 4. Request table
 
-Prima di tutto: il parsing e la validazione della sintassi avvengono fuori
-dalla sezione critica. La request table viene aggiornata solo se il comando
-e' riconosciuto come mutativo ben formato con `request_id` valido. Errori di
-parsing (`ERR usage: ...`, `ERR invalid_request_id`) non vengono mai salvati
-in tabella. Gli errori applicativi (`ERR version_mismatch`, `NOT_FOUND`) sono
-invece esiti legittimi di un comando ben formato e vengono memorizzati e
-riprodotti come qualsiasi altra risposta.
+Il server mantiene:
 
-
-Quando il server riceve un comando mutativo valido con (`client_id, seq`),
-esegue atomicamente rispetto a tutte le altre operazioni mutative i passi
-di controllo della request table, eventuale applicazione allo store,
-costruzione della risposta e salvataggio della risposta.
-
-L'invio della risposta al client puo' avvenire fuori dalla sezione critica,
-usando la stringa di risposta gia' determinata.
-
+```text
+request_table[client_id][seq] = (payload_canonico, response)
 ```
-1. Se (client_id, seq) e' nella request table:
-     a. confronta il payload canonico della nuova richiesta con quello salvato;
-     b. se i payload coincidono: determina come risposta la risposta salvata;
-     c. se i payload differiscono: determina come risposta ERR request_id_conflict;
-     d. termina la sezione critica e invia la risposta al client (STOP).
+
+Per ogni richiesta mutativa valida già vista, il server salva:
+
+- il payload canonico della richiesta;
+- la risposta prodotta alla prima esecuzione.
+
+Il payload canonico serve a distinguere un retry legittimo dal riuso errato dello stesso `request_id`.
+
+---
+
+## 5. Semantica del retry
+
+Quando arriva una richiesta mutativa valida:
+
+```text
+1. Se (client_id, seq) è già nella request table:
+      - stesso payload  -> restituisce la risposta cached;
+      - payload diverso -> ERR request_id_conflict.
 
 2. Se seq <= eviction_boundary[client_id]:
-     a. determina come risposta ERR request_id_expired;
-     b. termina la sezione critica e invia la risposta al client (STOP).
+      - restituisce ERR request_id_expired.
 
-3. Altrimenti e' la prima esecuzione:
-     a. applica l'effetto allo store;
-     b. costruisci la risposta;
-     c. salva (payload_canonico, risposta) in request_table[(client_id, seq)];
-     d. termina la sezione critica;
-     e. invia la risposta al client.
+3. Altrimenti:
+      - applica l'operazione allo store;
+      - costruisce la risposta;
+      - salva payload e risposta nella request table;
+      - esegue eventuale eviction;
+      - restituisce la risposta.
 ```
 
-L'atomicita' di questi passi e' fondamentale per la safety: senza di essa,
-due thread che ricevono lo stesso `request_id` contemporaneamente potrebbero
-superare entrambi il controllo al passo 1 e applicare l'effetto due volte.
+Il controllo della request table, l'applicazione dell'effetto, il salvataggio della risposta e l'eventuale eviction avvengono dentro la stessa sezione critica protetta da lock.
 
-Il campo `eviction_boundary[client_id]` e' il massimo `seq` gia' evictato
-per quel client (vedi sezione Garbage Collection).
+Gli errori di parsing non vengono salvati nella request table. Gli errori applicativi prodotti da richieste ben formate, come `ERR version_mismatch current=<n>` o `NOT_FOUND` su `DELETE_REQ`, vengono invece salvati e riprodotti al retry.
 
 ---
 
-## Comandi mutativi con `request_id`
+## 6. Comandi di sola lettura
 
-### `SET_REQ <client_id>:<seq> <key> <value...>`
+Le operazioni di sola lettura non usano `request_id` e osservano lo stato corrente dello store.
 
-Crea o sovrascrive il valore di `key` con `value`.
+| Comando | Risposta |
+|---|---|
+| `PING` | `PONG` |
+| `GET <key>` | `OK <value>` oppure `NOT_FOUND` |
+| `GETV <key>` | `OK version=<n> <value>` oppure `NOT_FOUND` |
+| `EXISTS <key>` | `OK true` oppure `OK false` |
+| `KEYS` | `OK <key1> <key2> ...` oppure `OK` se vuoto |
+| `STATS` | `OK keys=<n> clients=<n> cached_requests=<n> window_size=<n>` |
+| `QUIT` | `BYE` |
 
-Richiesta:
+---
+
+## 7. Comandi mutativi idempotenti
+
+Questi comandi transitano per la request table.
+
+### SET_REQ
 
 ```text
-SET_REQ clientA:42 corso sistemi-distribuiti
+SET_REQ <client_id>:<seq> <key> <value...>
 ```
 
-Payload canonico memorizzato:
+Effetto: crea o sovrascrive il valore di `key`.
 
-```text
-SET_REQ corso sistemi-distribuiti
-```
-
-Risposte possibili (prima esecuzione):
+Risposte:
 
 ```text
 OK version=<n>
-```
-
-In caso di retry con stesso `request_id` e stesso payload:
-
-```text
-OK version=<n>
-```
-
-(la risposta memorizzata la prima volta, senza riapplicare l'effetto)
-
-In caso di retry con stesso `request_id` ma payload diverso:
-
-```text
 ERR request_id_conflict
-```
-
-In caso di `seq` scaduto dalla finestra:
-
-```text
 ERR request_id_expired
 ```
 
-### `CAS_REQ <client_id>:<seq> <key> <expected_version> <value...>`
-
-Aggiorna `key` con `value` solo se la versione corrente e' `expected_version`.
-
-Richiesta:
+Esempio:
 
 ```text
-CAS_REQ clientA:43 corso 0 sistemi-distribuiti-v2
+SET_REQ clientA:0 corso ads
+-> OK version=0
 ```
 
-Payload canonico memorizzato:
+Un retry identico restituisce la stessa risposta senza riapplicare l'effetto.
+
+---
+
+### CAS_REQ
 
 ```text
-CAS_REQ corso 0 sistemi-distribuiti-v2
+CAS_REQ <client_id>:<seq> <key> <expected_version> <value...>
 ```
 
-Risposte possibili (prima esecuzione):
+Effetto: aggiorna `key` solo se la versione corrente coincide con `expected_version`.
+
+Risposte:
 
 ```text
 OK version=<n>
-```
-
-oppure (versione non corrispondente):
-
-```text
 ERR version_mismatch current=<m>
-```
-
-**Importante**: anche `ERR version_mismatch` viene memorizzato nella
-request table. Un retry con stesso `request_id` e stesso payload restituisce
-sempre lo stesso errore, indipendentemente dallo stato attuale della chiave.
-Lo store non viene modificato.
-
-In caso di retry con payload diverso:
-
-```text
+ERR not_found
 ERR request_id_conflict
+ERR request_id_expired
 ```
 
-### `DELETE_REQ <client_id>:<seq> <key>`
-
-Rimuove `key` dallo store e azzera la sua storia di versione.
-
-Richiesta:
+Esempio:
 
 ```text
-DELETE_REQ clientA:44 corso
+CAS_REQ clientA:1 corso 0 sistemi-distribuiti
+-> OK version=1
 ```
 
-Payload canonico memorizzato:
+Se una `CAS_REQ` fallisce per `version_mismatch`, il retry identico restituisce lo stesso errore salvato.
+
+---
+
+### DELETE_REQ
 
 ```text
-DELETE_REQ corso
+DELETE_REQ <client_id>:<seq> <key>
 ```
 
-Risposte possibili (prima esecuzione):
+Effetto: rimuove `key` dallo store.
+
+Risposte:
 
 ```text
-OK
-```
-
-oppure (chiave assente):
-
-```text
+OK deleted=true
 NOT_FOUND
+ERR request_id_conflict
+ERR request_id_expired
 ```
 
-Anche `NOT_FOUND` viene memorizzato e riprodotto identico al retry.
-
-Semantica della versione dopo `DELETE_REQ`: la chiave ritorna allo stato
-"assente" con versione implicita `-1`. Un successivo `SET_REQ` produce
-`version=0` come se la chiave non fosse mai esistita.
-
----
-
-## Comandi di lettura (senza `request_id`)
-
-Le operazioni di sola lettura sono idempotenti per natura. Non transitano
-per la request table e osservano lo stato corrente dello store al momento
-dell'esecuzione.
-
-- `PING` — risponde `OK PONG`
-- `GET <key>` — risponde `OK <value>` oppure `NOT_FOUND`
-- `GETV <key>` — risponde `OK version=<n> <value...>` oppure `NOT_FOUND`
-- `EXISTS <key>` — risponde `OK 1` oppure `OK 0`
-- `KEYS` — risponde `OK <key1> <key2> ...` (spazio-separati)
-- `QUIT` — risponde `OK BYE` e chiude la connessione
-
-Nota sul formato di `GETV`: i metadati (`version=<n>`) precedono il valore
-per evitare ambiguita' di parsing quando il valore contiene spazi o la
-stringa `version=`. Il client estrae `version=<n>` come secondo token e
-tratta il resto della riga come valore esatto.
-
----
-
-## Garbage Collection della request table
-
-### Strategia base: sliding window
-
-Il server conserva, per ogni `client_id`, al piu' `N` voci recenti (ordinate
-per `seq`). Quando si inserisce una nuova voce e la finestra e' piena, la voce
-con `seq` piu' basso viene evictata.
-
-`N` e' un parametro di configurazione; il valore di default consigliato e' `100`.
-
-La strategia sliding window assume che un client corretto non invii nuove
-operazioni logiche con `seq` minore di quelli gia' emessi, salvo retry di
-richieste ancora presenti nella finestra. Richieste fortemente fuori ordine
-possono ridurre la durata effettiva della garanzia, perche' una nuova voce
-potrebbe evictare una voce vecchia ancora in attesa di retry.
-
-### Eviction boundary (low-watermark)
-
-Ogni volta che una voce viene evictata, il server aggiorna il campo:
+Esempio:
 
 ```text
-eviction_boundary[client_id] = max(eviction_boundary[client_id], seq_evictato)
+DELETE_REQ clientA:2 corso
+-> OK deleted=true
 ```
 
-Questo campo e' fondamentale per distinguere due situazioni altrimenti
-indistinguibili:
+Anche `NOT_FOUND`, se prodotto da `DELETE_REQ` ben formata, viene salvato e riprodotto al retry.
 
-- `seq` **mai visto**: il client sta inviando una prima richiesta legittima;
-- `seq` **gia' evictato**: il client sta ritentando fuori finestra.
+---
 
-Senza l'eviction boundary, il server non puo' distinguere una richiesta mai vista da una richiesta gia' evictata; quindi rischierebbe di trattare un retry fuori finestra come una nuova prima esecuzione.
+## 8. Comandi mutativi non idempotenti
 
-Il controllo sul passo 2 del processo di retry e' quindi:
+I seguenti comandi sono presenti solo per compatibilità e test manuale. Non transitano per la request table e non sono sicuri rispetto al retry cieco.
+
+| Comando | Risposta |
+|---|---|
+| `SET <key> <value...>` | `OK version=<n>` |
+| `CAS <key> <expected_version> <value...>` | `OK version=<n>`, `ERR version_mismatch current=<m>` oppure `ERR not_found` |
+| `DELETE <key>` | `OK deleted=true` oppure `NOT_FOUND` |
+
+I client corretti devono usare `SET_REQ`, `CAS_REQ` e `DELETE_REQ`.
+
+---
+
+## 9. Garbage collection della request table
+
+Il server non conserva tutti i `request_id` per sempre.
+
+Per ogni `client_id`, conserva al massimo `N` richieste recenti.
+
+Default:
 
 ```text
-se seq <= eviction_boundary[client_id]: ERR request_id_expired
+N = 100
 ```
 
-Se un `client_id` non ha mai subito eviction, `eviction_boundary[client_id]`
-e' considerato pari a `-1`. Poiche' `seq` e' non negativo, la condizione
-`seq <= -1` non e' mai vera: nessuna prima richiesta valida viene
-erroneamente rifiutata come scaduta.
+Quando la finestra supera `N`, viene rimossa la voce con `seq` minimo.
 
-### Estensione opzionale: ACK cumulativo
+Per distinguere una richiesta mai vista da un retry ormai evictato, il server mantiene:
 
-Il comando `ACK <client_id> <seq>` puo' essere implementato come estensione
-opzionale per permettere al client di liberare esplicitamente voci dalla
-finestra.
+```text
+eviction_boundary[client_id]
+```
 
-Effetto: il server evicta tutte le voci con `seq <= ack_seq` e aggiorna
-`eviction_boundary` di conseguenza.
+Regola:
 
-Questa estensione non e' richiesta dalla versione base del contratto e non
-e' necessaria per la correttezza. Aumenta la complessita' semantica in
-presenza di retry still-in-flight o richieste fuori ordine. Se implementata,
-deve essere documentata separatamente.
+```text
+se seq <= eviction_boundary[client_id]:
+    ERR request_id_expired
+```
+
+Nella versione corrente, l'eviction cerca il `seq` minimo nella finestra del client. Il costo è quindi `O(N)`, con `N` bounded e configurabile.
 
 ---
 
-## Proprieta' di Safety
+## 10. Errori
 
-**Nessun doppio effetto.**
-Una stessa operazione mutativa, identificata dal `request_id`, viene
-applicata al piu' una volta allo store, anche se il client la invia piu' volte
-con lo stesso payload. Questa garanzia dipende dall'atomicita' della sezione
-critica descritta in "Comportamento al retry".
-
-**Le richieste diverse non si confondono per chiave.**
-La chiave di ricerca nella request table e' `(client_id, seq)`, non la chiave
-KV. Due operazioni dello stesso client su chiavi diverse con `seq` diversi
-sono trattate come richieste indipendenti.
-
-**Il conflitto di payload viene rilevato.**
-Se lo stesso `request_id` viene usato con un payload diverso (errore del
-client), il server risponde `ERR request_id_conflict` senza applicare alcun
-effetto e senza sovrascrivere la risposta gia' memorizzata.
-
-**Il replay e' coerente con l'effetto gia' applicato.**
-La risposta memorizzata riflette esattamente l'esito della prima applicazione,
-compresi gli esiti di errore applicativi. Un retry di un `CAS_REQ` fallito
-per `version_mismatch` ottiene sempre lo stesso errore. Gli errori di
-parsing non vengono memorizzati e non sono soggetti a questa garanzia.
+| Risposta | Significato | Salvata nella request table |
+|---|---|---|
+| `ERR unknown_command` | Comando non riconosciuto | No |
+| `ERR malformed` | Numero di argomenti errato | No |
+| `ERR bad_request_id` | `request_id` non valido | No |
+| `ERR bad_version` | Versione attesa non numerica | No |
+| `ERR request_id_conflict` | Stesso `request_id`, payload diverso | No |
+| `ERR request_id_expired` | Retry fuori finestra | No |
+| `ERR version_mismatch current=<n>` | `CAS_REQ` ben formata, ma versione non corrispondente | Sì |
+| `ERR not_found` | `CAS`/`CAS_REQ` su chiave assente | Sì solo per `CAS_REQ` |
+| `NOT_FOUND` | Chiave assente | Sì solo per `DELETE_REQ` |
 
 ---
 
-## Proprieta' di Liveness
+## 11. Garanzie del contratto
 
-**Il server fa progresso.**
-La GC della request table e' locale al singolo client e a costo limitato
-dalla dimensione della finestra `N`. Non richiede operazioni di rete ne'
-scansioni globali dello store.
+Il protocollo garantisce:
 
-**Un client corretto completa.**
-Il replay di un `request_id` e' garantito finche' la richiesta originale
-e' ancora presente nella finestra delle ultime `N` voci memorizzate per
-quel client. Se il client invia nuove mutazioni, le voci piu' vecchie
-vengono progressivamente evictate: un retry di una richiesta ormai uscita
-dalla finestra riceve `ERR request_id_expired` e non e' piu' coperto dalla
-garanzia di idempotenza.
-
-**La scadenza e' informativa, non deterministica sull'esito originale.**
-`ERR request_id_expired` non significa che la richiesta originale non sia
-stata applicata: significa solo che il server non conserva piu' abbastanza
-informazione per garantire il replay idempotente. Il client che riceve
-questo errore deve decidere autonomamente come procedere, ad esempio
-leggendo lo stato corrente con `GETV` prima di emettere una nuova richiesta.
+- una richiesta mutativa con stesso `(client_id, seq)` e stesso payload produce il proprio effetto al massimo una volta;
+- il retry riceve la stessa risposta della prima esecuzione;
+- richieste con stesso `request_id` ma payload diverso vengono rifiutate;
+- un retry fuori finestra non viene rieseguito, ma riceve `ERR request_id_expired`;
+- la memoria della request table è limitata dalla finestra `N`.
 
 ---
 
-## Cosa non e' garantito
+## 12. Cosa non è garantito
 
-- **Nessuna sopravvivenza al riavvio**: la request table e' esclusivamente
-  in memoria. Un riavvio del server azzera la tabella. Un retry di una
-  richiesta precedente al crash viene trattato come prima esecuzione.
-  L'aggiunta di persistenza (WAL della request table) e' una nota opzionale
-  futura, non parte di questo contratto.
-- **Nessuna garanzia di unicita' del `client_id`**: e' responsabilita' del
-  client scegliere un identificatore univoco nel proprio dominio.
-- **Nessun ordinamento globale** tra richieste di client diversi.
-- **Nessuna replica** della request table su altri nodi.
+Il protocollo non garantisce:
 
----
-
-## Comandi mutativi senza `request_id` (compatibilita')
-
-I comandi `SET`, `CAS` e `DELETE` (senza il suffisso `_REQ`) non fanno
-parte del contratto idempotente. Se presenti nell'implementazione, sono
-da trattare come operazioni non-idempotenti di compatibilita' con client
-precedenti: vengono eseguiti direttamente sullo store senza transitare
-per la request table, e il retry alla cieca e' a rischio del chiamante.
-
-I client corretti devono usare esclusivamente `SET_REQ`, `CAS_REQ` e
-`DELETE_REQ` per tutte le operazioni mutative.
+- persistenza dopo riavvio;
+- sopravvivenza della request table a crash del server;
+- replica della request table;
+- idempotenza dopo failover;
+- exactly-once distribuita;
+- autenticazione del `client_id`;
+- ordinamento globale tra client diversi;
+- replay oltre la finestra `N`.
 
 ---
 
-## Tabella degli errori di protocollo
+## 13. Sintesi
 
-| Risposta                             | Causa                                                                        |
-| ------------------------------------ | ---------------------------------------------------------------------------- |
-| `ERR unknown_command`              | Il comando non e' riconosciuto                                               |
-| `ERR invalid_request_id`           | Il`request_id` non ha il formato `<id>:<seq>`                            |
-| `ERR request_id_expired`           | `seq <= eviction_boundary`; il server non garantisce piu' il replay        |
-| `ERR request_id_conflict`          | Stesso`request_id`, payload diverso da quello memorizzato                  |
-| `ERR version_mismatch current=<n>` | `CAS_REQ` fallita per versione non corrispondente (memorizzato in tabella) |
-| `ERR usage: ...`                   | Argomenti mancanti o malformati (non memorizzato in tabella)                 |
+Il sistema distingue quattro casi:
 
----
+```text
+stesso request_id, stesso payload     -> replay della risposta cached
+stesso request_id, payload diverso    -> ERR request_id_conflict
+request_id già evictato               -> ERR request_id_expired
+request_id mai visto                  -> prima esecuzione normale
+```
 
-## Punto chiave del design
-
-L'idempotenza non cambia la semantica dello store sottostante. Cambia il
-contratto verso il client su quante volte un effetto viene prodotto, e
-aggiunge una distinzione tra:
-
-- retry legittimo: stesso `request_id`, stesso payload → risposta cached;
-- errore del client: stesso `request_id`, payload diverso → conflitto esplicito;
-- retry fuori finestra: `seq` evictato → scadenza esplicita;
-- prima richiesta: `seq` mai visto e non evictato → esecuzione normale.
-
-In un sistema distribuito, un client non puo' distinguere tra "il server ha
-risposto ma la risposta e' andata persa" e "il server non ha mai ricevuto la
-richiesta". Con il `request_id` e la request table, il retry diventa sicuro
-entro la finestra dichiarata.
+Questa è la promessa centrale del contratto pubblico.

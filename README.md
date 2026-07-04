@@ -1,166 +1,277 @@
-﻿# Homework 3: KV Store con Retry Idempotenti
+# Homework 3: KV Store con Retry Idempotenti
 
-Estensione del KV store versionato con compare-and-set che introduce
-l'idempotenza delle operazioni mutative tramite `request_id`.
+Estensione di un Key-Value Store versionato con operazioni mutative idempotenti tramite `request_id`.
 
-## Problema risolto
+Il problema affrontato è tipico dei sistemi distribuiti: un client può inviare una scrittura, perdere la risposta e non sapere se il server l'abbia già applicata. Se ritenta alla cieca, rischia di applicare due volte lo stesso effetto.
 
-In un sistema distribuito un client può inviare una scrittura, perdere la
-risposta (timeout, disconnessione, crash del thread di rete) e non sapere
-se il server l'abbia già applicata. Un retry alla cieca rischia di applicare
-due volte lo stesso effetto su uno stato che nel frattempo potrebbe essere
-cambiato.
+La soluzione implementata associa ogni operazione mutativa a un identificatore:
 
-La soluzione è che il client accompagni ogni operazione mutativa con un
-identificatore univoco (`request_id`). Il server tiene traccia delle risposte
-già calcolate e, in caso di retry, restituisce la risposta memorizzata senza
-riapplicare l'effetto.
+```text
+<client_id>:<seq>
+```
+
+Il server mantiene una request table in memoria. Se riceve di nuovo lo stesso `request_id` con lo stesso payload, restituisce la risposta salvata senza riapplicare l'effetto.
+
+---
 
 ## File del progetto
 
 | File | Contenuto |
 |---|---|
-| `api-contract.md` | Contratto pubblico del protocollo: comandi, risposte, semantica, GC |
-| `SAFETY_LIVENESS.md` | Proprietà formali di safety (S1–S4) e liveness (L1–L3) |
-| `TECHNICAL_NOTE.md` | Trade-off scelti, limiti della versione corrente, possibili evoluzioni |
-| `README.md` | Questo file |
+| `server.py` | Server TCP multithread e logica del KV store |
+| `client.py` | Client interattivo con generazione di `request_id` e comando `retry` |
+| `acceptance_test.py` | Test automatici del contratto di idempotenza |
+| `api-contract.md` | Contratto pubblico del protocollo |
+| `SAFETY_LIVENESS.md` | Proprietà di safety e liveness |
+| `TECHNICAL_NOTE.md` | Scelte tecniche, limiti ed evoluzioni possibili |
+| `homework_3.md` | Traccia dell'homework |
 
-## Come si esegue
+---
 
-### Requisiti
+## Requisiti
 
 - Python 3.9 o superiore
-- Nessuna dipendenza esterna (solo standard library)
+- Nessuna dipendenza esterna
+- Solo standard library
 
-### Avvio del server
+---
 
-```bash
-python server.py
-```
+## Avvio
 
-Il server ascolta su `127.0.0.1:6379` di default.
-
-### Connessione con il client interattivo
+### Server
 
 ```bash
-python client.py
+python3 server.py
 ```
 
-oppure con host e porta espliciti:
+Default:
+
+```text
+127.0.0.1:6379
+```
+
+Con host e porta espliciti:
 
 ```bash
-python client.py --host 127.0.0.1 --port 6379
+python3 server.py --host 127.0.0.1 --port 6379
 ```
 
-### Esecuzione dei test di accettazione
+### Client
+
+In un secondo terminale:
 
 ```bash
-python acceptance_test.py
+python3 client.py --client-id clientA
 ```
 
-La suite avvia il server come sottoprocesso, esegue tutti i test e
-stampa il risultato. Non sono necessarie dipendenze esterne.
+Oppure:
 
-## Comandi disponibili
+```bash
+python3 client.py --host 127.0.0.1 --port 6379 --client-id clientA
+```
 
-### Comandi di sola lettura (naturalmente idempotenti)
+---
+
+## Comandi del client interattivo
+
+| Comando client | Significato |
+|---|---|
+| `ping` | Verifica connessione |
+| `get <key>` | Legge il valore |
+| `getv <key>` | Legge valore e versione |
+| `exists <key>` | Verifica esistenza |
+| `keys` | Mostra le chiavi |
+| `stats` | Mostra statistiche server |
+| `set <key> <value...>` | Invia `SET_REQ` con nuovo `request_id` |
+| `cas <key> <expected_version> <value...>` | Invia `CAS_REQ` |
+| `delete <key>` | Invia `DELETE_REQ` |
+| `retry` | Reinvia l'ultima richiesta mutativa con lo stesso `request_id` |
+| `raw <command>` | Invia un comando grezzo al server |
+| `help` | Mostra l'help |
+| `quit` | Chiude la connessione |
+
+---
+
+## Protocollo supportato
+
+### Letture
+
+Le letture non usano `request_id`.
 
 | Comando | Risposta |
 |---|---|
-| `PING` | `OK PONG` |
+| `PING` | `PONG` |
 | `GET <key>` | `OK <value>` oppure `NOT_FOUND` |
 | `GETV <key>` | `OK version=<n> <value>` oppure `NOT_FOUND` |
-| `EXISTS <key>` | `OK 1` oppure `OK 0` |
-| `KEYS` | `OK <key1> <key2> ...` |
-| `QUIT` | `OK BYE` (chiude la connessione) |
+| `EXISTS <key>` | `OK true` oppure `OK false` |
+| `KEYS` | `OK <key1> <key2> ...` oppure `OK` |
+| `STATS` | `OK keys=<n> clients=<n> cached_requests=<n> window_size=<n>` |
+| `QUIT` | `BYE` |
 
-### Comandi mutativi idempotenti (con `request_id`)
+### Mutazioni idempotenti
 
-Il `request_id` ha il formato `<client_id>:<seq>` dove `seq` è un intero
-non negativo strettamente crescente per ogni nuova operazione logica.
-Esempio: `clientA:42`.
-
-| Comando | Risposta (prima esecuzione) |
-|---|---|
-| `SET_REQ <request_id> <key> <value...>` | `OK version=<n>` |
-| `CAS_REQ <request_id> <key> <expected_version> <value...>` | `OK version=<n>` oppure `ERR version_mismatch current=<m>` |
-| `DELETE_REQ <request_id> <key>` | `OK` oppure `NOT_FOUND` |
-
-Al retry con stesso `request_id` e stesso payload, il server restituisce
-la risposta memorizzata senza riapplicare l'effetto.
-
-### Comandi mutativi non idempotenti (compatibilità)
+Questi comandi transitano per la request table.
 
 | Comando | Risposta |
 |---|---|
-| `SET <key> <value...>` | `OK version=<n>` |
-| `CAS <key> <expected_version> <value...>` | `OK version=<n>` oppure `ERR version_mismatch current=<m>` |
-| `DELETE <key>` | `OK` oppure `NOT_FOUND` |
+| `SET_REQ <request_id> <key> <value...>` | `OK version=<n>` |
+| `CAS_REQ <request_id> <key> <expected_version> <value...>` | `OK version=<n>`, `ERR version_mismatch current=<m>` oppure `ERR not_found` |
+| `DELETE_REQ <request_id> <key>` | `OK deleted=true` oppure `NOT_FOUND` |
 
-Questi comandi non transitano per la request table. Il retry alla cieca
-è a rischio del chiamante.
+Casi speciali:
+
+| Caso | Risposta |
+|---|---|
+| Stesso `request_id`, stesso payload | Replay della risposta salvata |
+| Stesso `request_id`, payload diverso | `ERR request_id_conflict` |
+| Retry fuori finestra | `ERR request_id_expired` |
+
+### Mutazioni non idempotenti
+
+Sono presenti solo per compatibilità e test manuale. Non fanno parte della garanzia di idempotenza.
+
+```text
+SET <key> <value...>
+CAS <key> <expected_version> <value...>
+DELETE <key>
+```
+
+I client corretti devono usare `SET_REQ`, `CAS_REQ` e `DELETE_REQ`.
+
+---
+
+## Esempio manuale
+
+Avviare il server:
+
+```bash
+python3 server.py
+```
+
+Avviare il client:
+
+```bash
+python3 client.py --client-id clientA
+```
+
+Eseguire:
+
+```text
+ping
+set corso ads
+getv corso
+retry
+getv corso
+cas corso 0 sistemi-distribuiti
+retry
+getv corso
+delete corso
+retry
+getv corso
+quit
+```
+
+Output atteso nei punti principali:
+
+```text
+-> PING
+<- PONG
+
+-> SET_REQ clientA:0 corso ads
+<- OK version=0
+
+-> SET_REQ clientA:0 corso ads
+<- OK version=0
+
+-> CAS_REQ clientA:1 corso 0 sistemi-distribuiti
+<- OK version=1
+
+-> CAS_REQ clientA:1 corso 0 sistemi-distribuiti
+<- OK version=1
+
+-> DELETE_REQ clientA:2 corso
+<- OK deleted=true
+
+-> DELETE_REQ clientA:2 corso
+<- OK deleted=true
+
+-> GETV corso
+<- NOT_FOUND
+```
+
+Il punto importante è che il retry non incrementa la versione una seconda volta e non riesegue il delete.
+
+---
+
+## Test automatici
+
+Eseguire:
+
+```bash
+python3 acceptance_test.py
+```
+
+La suite importa direttamente `KVStore` da `server.py` e testa `handle_line()`.
+
+Questo rende i test rapidi, deterministici e indipendenti dal timing di rete.
+
+I test coprono:
+
+- retry di `SET_REQ`;
+- retry di `CAS_REQ` riuscita;
+- retry di `CAS_REQ` fallita;
+- riuso dello stesso `request_id` con payload diverso;
+- retry di `DELETE_REQ`;
+- separazione tra client diversi;
+- request id evictato dalla finestra;
+- comandi malformati.
+
+Output atteso:
+
+```text
+All tests passed: 11/11
+```
+
+---
 
 ## Garanzie principali
 
-- **At-most-once execution**: una richiesta con dato `request_id` applica il
-  proprio effetto allo store al più una volta.
-- **Replay coerente**: la risposta al retry è identica a quella della prima
-  esecuzione, inclusi gli errori applicativi (`ERR version_mismatch`,
-  `NOT_FOUND`).
-- **Memoria limitata**: per ogni `client_id` il server conserva al più `N=100`
-  voci (sliding window). La garbage collection è O(1) per operazione, senza
-  thread di background.
-- **Scadenza esplicita**: un retry fuori finestra riceve `ERR request_id_expired`
-  invece di essere silenziosamente rieseguito.
+- Una richiesta mutativa identificata da `(client_id, seq)` viene applicata al massimo una volta entro la finestra mantenuta dal server.
+- Un retry identico riceve la stessa risposta della prima esecuzione.
+- Lo stesso `request_id` con payload diverso viene rifiutato.
+- Un retry fuori finestra riceve `ERR request_id_expired` e non viene rieseguito.
+- La request table è limitata a `N` richieste per client.
 
-## Esperimento 1: retry sicuro dopo timeout simulato
+Default:
 
-```
-SET_REQ clientA:1 corso sistemi-distribuiti   → OK version=0
-SET_REQ clientA:1 corso sistemi-distribuiti   → OK version=0  (retry)
-GETV corso                                    → OK version=0 sistemi-distribuiti
+```text
+N = 100
 ```
 
-La versione è 0 in entrambi i casi: l'effetto è stato applicato una sola volta.
+---
 
-## Esperimento 2: CAS_REQ non si applica due volte
+## Limiti dichiarati
 
+- La request table è solo in memoria.
+- L'idempotenza non sopravvive a un riavvio del server.
+- Il sistema è single-node.
+- Non c'è replica della request table.
+- Non c'è autenticazione del `client_id`.
+- Non c'è ordinamento globale tra client diversi.
+- Non c'è garanzia exactly-once distribuita.
+- La garbage collection ha costo `O(N)`, con `N` bounded e configurabile.
+
+---
+
+## Sintesi
+
+Il progetto garantisce retry sicuri entro una singola istanza server e dentro la finestra dichiarata.
+
+La logica centrale è:
+
+```text
+stesso request_id, stesso payload     -> replay risposta salvata
+stesso request_id, payload diverso    -> ERR request_id_conflict
+request_id già evictato               -> ERR request_id_expired
+request_id mai visto                  -> prima esecuzione normale
 ```
-SET_REQ clientA:10 contatore zero             → OK version=0
-CAS_REQ clientA:11 contatore 0 uno           → OK version=1
-CAS_REQ clientA:11 contatore 0 uno           → OK version=1  (retry)
-GETV contatore                               → OK version=1 uno
-```
-
-La versione è 1, non 2: il retry ha restituito la risposta cached.
-
-## Esperimento 3: conflitto di payload rilevato
-
-```
-SET_REQ clientA:20 chiave valore-A           → OK version=0
-SET_REQ clientA:20 chiave valore-B           → ERR request_id_conflict
-GETV chiave                                  → OK version=0 valore-A
-```
-
-Il server segnala il riuso errato dello stesso `request_id` con payload diverso.
-
-## Esperimento 4: scadenza della finestra
-
-```
--- invio 101 richieste distinte: clientA:0 ... clientA:100 --
-SET_REQ clientA:101 k v                      → OK version=101  (evicta seq=0)
-SET_REQ clientA:0 k v  (retry tardivo)       → ERR request_id_expired
-```
-
-Il retry fuori finestra riceve un errore esplicito invece di essere rieseguito.
-
-## Tabella degli errori
-
-| Risposta | Causa |
-|---|---|
-| `ERR unknown_command` | Comando non riconosciuto |
-| `ERR invalid_request_id` | `request_id` non nel formato `<id>:<seq>` |
-| `ERR request_id_expired` | `seq <= eviction_boundary`; garanzia scaduta |
-| `ERR request_id_conflict` | Stesso `request_id`, payload diverso |
-| `ERR version_mismatch current=<n>` | `CAS_REQ` fallita per versione non corrispondente |
-| `ERR usage: ...` | Argomenti mancanti o malformati |
