@@ -1,8 +1,8 @@
 # Proprietà di Safety e Liveness: KV Store con Retry Idempotenti
 
-Questo documento formalizza le proprietà di correttezza garantite dal protocollo
-descritto in `api-contract.md`. Per ogni proprietà viene indicata la motivazione
-tecnica ("Perché vale") e la condizione che potrebbe violarla.
+Questo documento descrive le proprietà di correttezza del progetto **KV Store con retry idempotenti tramite `request_id`**.
+
+Il sistema è un Key-Value Store single-node, TCP, multithread, con stato in memoria. L'obiettivo è impedire che il retry di una richiesta mutativa produca due volte lo stesso effetto.
 
 ---
 
@@ -109,6 +109,54 @@ il risultato di un'operazione diversa da quella richiesta.
 
 ---
 
+### S5 — Retry fuori finestra non rieseguito
+
+**Proprietà.** Se una richiesta è stata eliminata dalla finestra della request table, un retry successivo non viene eseguito come nuova richiesta.
+
+Il server risponde:
+
+```text
+ERR request_id_expired
+```
+
+Esempio con finestra `N = 2`:
+
+```text
+SET_REQ clientA:0 k v0  -> OK version=0
+SET_REQ clientA:1 k v1  -> OK version=1
+SET_REQ clientA:2 k v2  -> OK version=2
+SET_REQ clientA:0 k v0  -> ERR request_id_expired
+GETV k                  -> OK version=2 v2
+```
+
+**Motivazione.** Il server mantiene un boundary per ogni client:
+
+```text
+_eviction_boundary[client_id]
+```
+
+Se arriva un `seq` minore o uguale al boundary, il server sa che quella richiesta è troppo vecchia e non può più garantirne il replay.
+
+---
+
+### S6 — Errori di parsing non memorizzati
+
+**Proprietà.** Gli errori sintattici o di parsing non vengono salvati nella request table.
+
+Esempi:
+
+```text
+ERR usage: SET_REQ <request_id> <key> <value...>
+ERR usage: CAS_REQ <request_id> <key> <expected_version> <value...>
+ERR usage: DELETE_REQ <request_id> <key>
+ERR invalid_request_id
+ERR bad_version
+```
+
+**Motivazione.** La request table viene aggiornata solo per richieste mutative ben formate. Se il client corregge una richiesta malformata e la reinvia con lo stesso `request_id`, il server la tratta come prima richiesta valida.
+
+---
+
 ## Proprietà di Liveness
 
 Le proprietà di liveness affermano che **qualcosa di desiderato continua a
@@ -174,7 +222,34 @@ violazione del protocollo lato client, non un difetto del server.
 
 ---
 
-### L4 — L'idempotenza non sopravvive al failover Primary→Secondary
+### L4 — Errori terminali non bloccano il servizio
+
+**Proprietà.** Richieste malformate, in conflitto o fuori finestra non bloccano il server.
+
+Il server restituisce un errore esplicito e termina la gestione della richiesta:
+
+```text
+ERR malformed
+ERR bad_request_id
+ERR request_id_conflict
+ERR request_id_expired
+```
+
+Non ci sono attese su risorse esterne, consenso distribuito o retry automatici interni.
+
+---
+
+## Limiti dichiarati
+
+### Nessuna persistenza
+
+Store e request table sono solo in memoria. Dopo un riavvio, il server perde sia i dati sia le risposte cached.
+
+Conseguenza: un retry precedente al riavvio può essere trattato come prima esecuzione.
+
+---
+
+### L'idempotenza non sopravvive al failover Primary→Secondary
 
 **Proprietà (limite dichiarato).** Se il Primary crasha e il Secondary si
 promuove a nuovo Primary, la request table del nuovo Primary è **vuota**.
@@ -209,25 +284,43 @@ non è prevenuta dall'implementazione corrente.
    nella request table. La replicazione asincrona non è sufficiente perché
    lascia aperta la stessa finestra di rischio.
 
-Queste estensioni non fanno parte del contratto corrente e non sono
-implementate. Questo limite è coerente con la sezione *"Cosa non è garantito"*
-del file `api-contract.md` che dichiara: *"Nessuna replica della request
-table su altri nodi."*
+---
+
+### Nessuna exactly-once distribuita
+
+Il progetto garantisce **at-most-once execution locale entro finestra**.
+
+Non garantisce:
+
+- exactly-once distribuita;
+- consenso;
+- replica;
+- recovery idempotente dopo crash;
+- ordinamento globale tra client diversi.
 
 ---
 
-## Tabella riassuntiva
+### Nessuna autenticazione del client_id
 
-| Proprietà | Garantita | Condizione |
-|---|---|---|
-| Nessun doppio effetto (S1) | Sì | `(client_id, seq)` nella finestra |
-| Replay coerente con l'effetto (S2) | Sì | Incondizionata |
-| Richieste distinte non si confondono (S3) | Sì | Incondizionata |
-| Conflitto di payload rilevato (S4) | Sì | Incondizionata |
-| Memoria limitata per client (L1) | Sì | Window size N applicata |
-| GC non blocca il servizio (L2) | Sì | Eviction inline O(1) |
-| Retry garantito per client corretto (L3) | Sì | Client rispetta finestra N |
-| Sopravvivenza al riavvio | No | Request table solo in memoria |
-| Garanzia dopo seq evictato (S1) | No | Fuori dalla sliding window |
-| Ordinamento globale tra client | No | Design single-node |
-| Idempotenza dopo failover Primary→Secondary (L4) | No | Request table non replicata sul Secondary |
+Il server accetta il `client_id` dichiarato dal client. Un client malevolo potrebbe dichiarare l'identità di un altro client.
+
+Questo è fuori dal contratto corrente.
+
+---
+
+## Conclusione
+
+Il progetto garantisce che una richiesta mutativa ben formata, identificata da `(client_id, seq)`, produca il proprio effetto al massimo una volta entro la finestra mantenuta dal server.
+
+La garanzia si basa su:
+
+```text
+request_id
+payload canonico
+response cached
+lock sulla sezione check-then-apply
+sliding window
+eviction boundary
+```
+
+Questa combinazione rende sicuro il retry locale entro una singola istanza server e rende esplicite le condizioni fuori garanzia.

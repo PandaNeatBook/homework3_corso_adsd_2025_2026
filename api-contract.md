@@ -276,13 +276,26 @@ dell'esecuzione.
 - `GET <key>` — risponde `OK <value>` oppure `NOT_FOUND`
 - `GETV <key>` — risponde `OK version=<n> <value...>` oppure `NOT_FOUND`
 - `EXISTS <key>` — risponde `OK 1` oppure `OK 0`
-- `KEYS` — risponde `OK <key1> <key2> ...` (spazio-separati)
+- `KEYS` — risponde `OK <key1> <key2> ...` (spazio-separati) oppure `OK` se lo
+  store e' vuoto
+- `STATS` — risponde `OK keys=<n> clients=<n> cached_requests=<n> window_size=<n>`
 - `QUIT` — risponde `OK BYE` e chiude la connessione
 
 Nota sul formato di `GETV`: i metadati (`version=<n>`) precedono il valore
 per evitare ambiguita' di parsing quando il valore contiene spazi o la
 stringa `version=`. Il client estrae `version=<n>` come secondo token e
 tratta il resto della riga come valore esatto.
+
+Nota su `STATS`: restituisce in una sola risposta quattro contatori utili
+per monitorare lo stato del server:
+
+- `keys`: numero di chiavi attualmente presenti nello store;
+- `clients`: numero di `client_id` distinti con almeno una voce nella request table;
+- `cached_requests`: numero totale di voci nella request table (somma su tutti i client);
+- `window_size`: dimensione massima configurata della sliding window (`N`).
+
+`STATS` e' un comando di sola lettura: non transita per la request table e
+non richiede `request_id`.
 
 ---
 
