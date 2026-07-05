@@ -1,4 +1,11 @@
 #!/usr/bin/env python3
+"""
+Client interattivo per il Router.
+
+Estende il client dell'Homework 3 (SET/CAS/DELETE con generazione automatica
+del request_id e comando "retry") con i comandi di amministrazione dello
+sharding: add_shard, remove_shard, rebalance.
+"""
 from __future__ import annotations
 
 import argparse
@@ -131,7 +138,7 @@ class KVClient:
             self._arity(parts, 1, "stats")
             return "STATS"
 
-        if cmd in {"get", "getv", "exists"}:
+        if cmd in {"get", "getv"}:
             self._arity(parts, 2, f"{cmd} <key>")
             return f"{cmd.upper()} {parts[1]}"
 
@@ -151,6 +158,18 @@ class KVClient:
             self._arity(parts, 2, "delete <key>")
             return f"DELETE_REQ {self.next_id()} {parts[1]}"
 
+        if cmd == "add_shard":
+            self._arity(parts, 3, "add_shard <id> <host:port>")
+            return f"ADD_SHARD {parts[1]} {parts[2]}"
+
+        if cmd == "remove_shard":
+            self._arity(parts, 3, "remove_shard <id> <host:port>")
+            return f"REMOVE_SHARD {parts[1]} {parts[2]}"
+
+        if cmd == "rebalance":
+            self._arity(parts, 1, "rebalance")
+            return "REBALANCE"
+
         return None
 
     @staticmethod
@@ -166,13 +185,15 @@ Available commands:
   ping
   get <key>
   getv <key>
-  exists <key>
   keys
   stats
   set <key> <value...>
   cas <key> <expected_version> <value...>
   delete <key>
   retry
+  add_shard <id> <host:port>
+  remove_shard <id> <host:port>
+  rebalance
   raw <protocol command>
   help
   quit
@@ -183,7 +204,7 @@ Available commands:
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=6379)
+    parser.add_argument("--port", type=int, default=7000)
     parser.add_argument("--client-id", default="clientA")
     return parser.parse_args()
 

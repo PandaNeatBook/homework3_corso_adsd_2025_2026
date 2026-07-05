@@ -1,290 +1,140 @@
-# Proprietà di Safety e Liveness: KV Store con Retry Idempotenti
+```markdown
+# Proprietà di Safety e Liveness: Router, Idempotenza e Rebalancing
 
-Questo documento descrive le proprietà di correttezza del progetto **KV Store con retry idempotenti tramite `request_id`**.
+Questo documento descrive le proprietà di correttezza architetturale del progetto **KV Store Distribuito con Gateway (Router), Rebalancing e Retry Idempotenti**.
 
-Il sistema è un Key-Value Store single-node, TCP, multithread, con stato in memoria. L'obiettivo è impedire che il retry di una richiesta mutativa produca due volte lo stesso effetto.
+Il sistema è passato da un singolo nodo a un'architettura distribuita composta da un **Router** (che gestisce l'idempotenza e l'instradamento), un **Coordinator** (che gestisce la migrazione dei dati) e molteplici **ShardNode** (che memorizzano fisicamente il dato). L'obiettivo è garantire transizioni di topologia sicure, prevenire la perdita o la resurrezione di dati e impedire che il retry di una richiesta mutativa produca due volte lo stesso effetto.
 
 ---
 
 ## Proprietà di Safety
 
 Le proprietà di safety affermano che **non accade mai qualcosa di scorretto**.
-In questo sistema, "scorretto" significa principalmente: un effetto applicato più
-di una volta, una risposta incoerente con l'effetto prodotto, o due richieste
-distinte confuse tra loro.
+In questo sistema, "scorretto" significa: un effetto applicato più di una volta, perdita di dati durante la migrazione, resurrezione di dati cancellati, o risposte incoerenti ai retry.
 
 ---
 
-### S1 — Nessun doppio effetto
+### S1 — Nessun doppio effetto (Idempotenza di Rete)
 
-**Proprietà.** Un'operazione mutativa identificata da `(client_id, seq)`
-viene applicata allo store **al più una volta**, indipendentemente da quante
-volte il client invia la stessa richiesta con lo stesso `request_id` e
-stesso payload.
+**Proprietà.** Un'operazione mutativa identificata da `(client_id, seq)` viene inoltrata agli ShardNode **al più una volta**, indipendentemente dai retry del client.
 
-**Perché vale.** Il lookup nella request table e l'applicazione dell'effetto allo store sono protetti da una strategia di locking a grana fine a due livelli. I lock vengono acquisiti in un ordine rigoroso e gerarchico (prima il client, poi la chiave) per prevenire deadlock e garantire l'atomicità locale:
+**Perché vale.** La garanzia è applicata sul Router. Il lookup nella request table e l'inoltro di rete sono protetti dal `client_lock`:
 
-```
-1. Acquisizione del `client_lock` per il client_id specifico.
+```text
+1. Acquisizione del `client_lock` per il client_id specifico sul Router.
 2. Controlla request_table[(client_id, seq)]
-   → trovato: restituisci la risposta memorizzata (STOP, nessun effetto).
+   → trovato: restituisci la risposta memorizzata (STOP, nessuna rete).
 3. Controlla eviction_boundary[client_id]
-   → seq <= boundary: ERR request_id_expired (STOP, nessun effetto).
-4. Acquisizione del `key_lock` specifico per la chiave.
-5. Acquisizione del `store_structure_lock` (solo se l'operazione altera la struttura globale del dizionario).
-6. Applica l'effetto allo store e calcola la nuova versione.
-7. Rilascio del `store_structure_lock` e del `key_lock`.
-8. Costruisci e salva (payload_canonico, risposta) in request_table.
-9. Rilascio del `client_lock`.
+   → seq <= boundary: ERR_REQUEST_ID_EXPIRED (STOP, nessuna rete).
+4. Fotografia lock-free della topologia di routing.
+5. Generazione del Sequence Number globale.
+6. Chiamata di rete (TCP) allo ShardNode di destinazione.
+7. Costruisci e salva (payload_canonico, risposta) in request_table.
+8. Rilascio del `client_lock`.
+
 ```
 
-Poiché il controllo iniziale (2) e il salvataggio finale (8) avvengono sotto lo stesso client_lock, due thread che ricevono lo stesso request_id contemporaneamente si serializzano alla radice: il secondo trova già la voce in tabella e restituisce la risposta cached senza toccare lo store o acquisire lock aggiuntivi.
-
-**Cosa potrebbe violarla.** Se il client_lock non coprisse sia la fase di check iniziale che quella di salvataggio in cache, due thread potrebbero superare entrambi il controllo e acquisire in sequenza il key_lock, applicando l'effetto due volte. Inoltre, se l'ordine di acquisizione dei lock (client -> chiave) non fosse strettamente rispettato, si verificherebbero dei deadlock.
+Due thread che ricevono lo stesso `request_id` contemporaneamente sul Router si serializzano: il secondo trova già la voce in tabella e restituisce la risposta cached senza contattare gli shard.
 
 ---
 
 ### S2 — Il replay è coerente con l'effetto applicato
 
-**Proprietà.** La risposta restituita al retry è sempre quella prodotta
-durante la prima esecuzione, e riflette esattamente l'esito di quella prima
-applicazione. In particolare:
+**Proprietà.** La risposta restituita al retry è sempre quella prodotta durante la prima esecuzione, anche se lo stato dello ShardNode è cambiato.
 
-- se la prima esecuzione ha prodotto `OK version=3`, il retry riceve
-  `OK version=3` anche se nel frattempo la chiave è stata aggiornata;
-- se la prima esecuzione ha prodotto `ERR version_mismatch current=5`,
-  il retry riceve lo stesso errore, anche se la versione della chiave
-  è cambiata;
-- se la prima esecuzione ha prodotto `NOT_FOUND` (su un `DELETE_REQ`
-  di chiave assente), il retry riceve `NOT_FOUND`.
+* Se la prima esecuzione ha prodotto `OK version=3`, il retry riceve `OK version=3`.
+* Se la prima esecuzione ha prodotto `ERR_CAS_CONFLICT current=5`, il retry riceve lo stesso errore.
+* Se la prima esecuzione ha prodotto `ERR_NOT_FOUND`, il retry riceve `ERR_NOT_FOUND`.
 
-**Perché vale.** La risposta viene salvata nella request table dopo che l'effetto è stato applicato allo store, ma prima che il client_lock venga rilasciato. Non esiste finestra temporale in cui un altro thread associato allo stesso client_id possa intromettersi tra la modifica dello store e la memorizzazione della risposta. Qualunque retry successivo si metterà in coda sul client_lock e troverà la risposta già in tabella.
-
-**Cosa potrebbe violarla.** Inviare la risposta al client o rilasciare il client_lock prima di salvarla in tabella aprirebbe una finestra in cui un retry concorrente potrebbe essere trattato come prima esecuzione. Questa inversione è espressamente vietata dal design.
+**Eccezione di transitorietà:** La risposta `ERR_REBALANCING` (generata quando una CAS è bloccata per migrazione in corso) **non** viene salvata nella request table, permettendo al client di ritentare legittimamente a rebalance concluso.
 
 ---
 
 ### S3 — Richieste diverse non si confondono
 
-**Proprietà.** Due operazioni con `seq` diversi, o di `client_id` diversi,
-sono trattate come richieste indipendenti. La chiave di ricerca nella request
-table è `(client_id, seq)`, non la chiave KV.
-
-**Perché vale.** La request table è indicizzata per coppia `(client_id, seq)`.
-Due richieste con `seq` diversi producono voci distinte, anche se toccano la
-stessa chiave KV. Due client diversi con lo stesso `seq` producono voci
-distinte perché il `client_id` è diverso.
-
-**Cosa potrebbe violarla.** Usare solo la chiave KV come indice della request
-table causerebbe la confusione di operazioni distinte dello stesso client.
+**Proprietà.** Due operazioni con `seq` diversi, o di `client_id` diversi, sono trattate come indipendenti. L'indice della cache sul Router è la tupla `(client_id, seq)`.
 
 ---
 
 ### S4 — Il conflitto di payload viene rilevato e segnalato
 
-**Proprietà.** Se lo stesso `request_id` viene inviato con un payload diverso
-da quello memorizzato (errore del client, bug, race condition lato chiamante),
-il server risponde `ERR request_id_conflict` senza applicare alcun effetto e
-senza sovrascrivere la risposta già memorizzata.
-
-**Perché vale.** Oltre alla risposta, la request table memorizza il **payload
-canonico** della prima richiesta. Al retry, il payload canonico della nuova
-richiesta viene confrontato con quello memorizzato. Se differiscono, il server
-produce `ERR request_id_conflict` e termina la sezione critica senza modificare
-né lo store né la tabella.
-
-**Cosa potrebbe violarla.** Memorizzare solo la risposta senza il payload
-canonico renderebbe impossibile distinguere un retry legittimo da un riuso
-errato dello stesso `request_id`. Il server risponderebbe silenziosamente con
-il risultato di un'operazione diversa da quella richiesta.
+**Proprietà.** Se lo stesso `request_id` viene riutilizzato con un payload diverso, il Router risponde `ERR_REQUEST_ID_CONFLICT` senza inoltrare nulla agli ShardNode. Il payload canonico viene memorizzato insieme alla risposta proprio per permettere questo controllo.
 
 ---
 
 ### S5 — Retry fuori finestra non rieseguito
 
-**Proprietà.** Se una richiesta è stata eliminata dalla finestra della request table, un retry successivo non viene eseguito come nuova richiesta.
-
-Il server risponde:
-
-```text
-ERR request_id_expired
-```
-
-Esempio con finestra `N = 2`:
-
-```text
-SET_REQ clientA:0 k v0  -> OK version=0
-SET_REQ clientA:1 k v1  -> OK version=1
-SET_REQ clientA:2 k v2  -> OK version=2
-SET_REQ clientA:0 k v0  -> ERR request_id_expired
-GETV k                  -> OK version=2 v2
-```
-
-**Motivazione.** Il server mantiene un boundary per ogni client:
-
-```text
-_eviction_boundary[client_id]
-```
-
-Se arriva un `seq` minore o uguale al boundary, il server sa che quella richiesta è troppo vecchia e non può più garantirne il replay.
+**Proprietà.** Se una richiesta è stata evictata (finestra piena), un retry successivo riceve in modo deterministico `ERR_REQUEST_ID_EXPIRED` controllando l'`eviction_boundary[client_id]`. Il Router non tenta mai di ri-eseguirla.
 
 ---
 
-### S6 — Errori di parsing non memorizzati
+### S6 — Prevenzione dei "Dati Zombie" (Tombstone)
 
-**Proprietà.** Gli errori sintattici o di parsing non vengono salvati nella request table.
+**Proprietà.** Un dato cancellato non riappare mai magicamente durante il fallback di lettura di un rebalance.
 
-Esempi:
+**Perché vale.** Nel sistema distribuito, `DELETE_REQ` non cancella fisicamente la chiave, ma esegue una `SET` del valore speciale `<TOMBSTONE>` con una versione aggiornata globale. Durante il rebalance, il Router legge la topologia nuova: se trova il Tombstone, sa che l'assenza è autoritativa e **non** fa fallback sulla topologia vecchia, impedendo di leggere e resuscitare un dato obsoleto non ancora eliminato.
 
-```text
-ERR usage: SET_REQ <request_id> <key> <value...>
-ERR usage: CAS_REQ <request_id> <key> <expected_version> <value...>
-ERR usage: DELETE_REQ <request_id> <key>
-ERR invalid_request_id
-ERR bad_version
-```
+---
 
-**Motivazione.** La request table viene aggiornata solo per richieste mutative ben formate. Se il client corregge una richiesta malformata e la reinvia con lo stesso `request_id`, il server la tratta come prima richiesta valida.
+### S7 — Migrazione Sicura (Two-Phase Commit Locale)
+
+**Proprietà.** Il fallimento del Coordinator durante un rebalance non causa mai perdita di dati.
+
+**Perché vale.** La migrazione segue 3 fasi rigorose:
+
+1. **Prepare (Copia):** Il Coordinator copia i dati sui nuovi shard, ma *non* li rimuove dai vecchi.
+2. **Commit:** Il Coordinator notifica al Router l'`ACK_REBALANCE_END`. Il Router cambia la topologia. (Punto di non ritorno).
+3. **Cleanup:** Solo ora il Coordinator rimuove fisicamente i vecchi dati. Se crasha in fase 1 o 2, i dati originali sono ancora intatti e il Router abortisce la migrazione leggendo la topologia vecchia.
 
 ---
 
 ## Proprietà di Liveness
 
-Le proprietà di liveness affermano che **qualcosa di desiderato continua a
-poter accadere**. In questo sistema ciò significa: il server fa progresso,
-la memoria è limitata, e un client corretto può completare le proprie
-operazioni.
+Le proprietà di liveness affermano che **il sistema fa progresso e un client corretto può completare le proprie operazioni**, anche in presenza di guasti parziali.
 
 ---
 
-### L1 — La memoria della request table è limitata
+### L1 — La memoria del Gateway (Router) è limitata
 
-**Proprietà.** Per ogni `client_id`, la request table contiene al più `N`
-voci (window size, default 100). Un singolo client non può causare crescita
-illimitata della memoria del server, indipendentemente da quante richieste
-invia.
-
-**Perché vale.** La struttura dati è una sliding window per client. Ogni
-volta che si inserisce una nuova voce e la finestra ha raggiunto `N`
-elementi, la voce con `seq` più basso viene rimossa. La dimensione è
-mantenuta a ≤ N voci per ogni `client_id`. Il costo di ogni eviction è O(1).
-
-**Cosa potrebbe violarla.** Non implementare la politica di eviction (conservare
-tutte le voci per sempre) causerebbe crescita lineare illimitata della memoria
-con il numero totale di richieste ricevute.
+**Proprietà.** Per ogni `client_id`, la request table contiene al più `N` voci (sliding window). L'eviction costa O(1) e avviene inline. Un client non può esaurire la RAM del Router.
 
 ---
 
-### L2 — La garbage collection non blocca il servizio
+### L2 — Il Rebalancing non blocca il sistema per sempre (Watchdog)
 
-**Proprietà.** L'eviction delle voci più vecchie dalla finestra non richiede
-operazioni di rete, scansioni globali, pause o background thread. Non
-introduce latency spike per i client.
+**Proprietà.** Se il Coordinator crasha "silenziosamente" durante una migrazione, il sistema non rimane incastrato permanentemente nello stato `_rebalancing = True` (che bloccherebbe a vita le CAS e appesantirebbe le GET).
 
-**Perché vale.** L'eviction avviene **inline** dentro la stessa acquisizione
-di lock della nuova richiesta. Costa al più una cancellazione dal dizionario
-(O(1)) e un aggiornamento di `eviction_boundary`. Non esiste un processo
-separato di garbage collection che potrebbe interferire con il servizio o
-richiedere lock aggiuntivi.
-
-**Cosa potrebbe violarla.** Usare una scadenza temporale (TTL) richiederebbe
-un thread di background che scansiona periodicamente la tabella, introducendo
-pause e complessità di locking. La sliding window evita questo problema.
+**Perché vale.** Il Router possiede un thread di **Watchdog** che, avviato all'`ACK_REBALANCE_START`, pinge costantemente il control plane del Coordinator. Se il Coordinator non risponde per `N` tentativi consecutivi, il Router abortisce autonomamente la migrazione ripristinando la topologia iniziale e sbloccando il traffico.
 
 ---
 
 ### L3 — Un client corretto può sempre completare una sequenza di retry
 
-**Proprietà.** Un client che usa `seq` strettamente crescenti e non invia
-più di `N` nuove richieste logiche senza aver completato il retry di una
-precedente riceverà sempre la risposta idempotente (cached) per quella
-richiesta.
-
-**Perché vale.** Con `seq` monotoni crescenti, la voce più vecchia nella
-finestra è sempre quella con `seq` più basso. Finché il client non avanza
-di più di `N` posizioni senza attendere l'acknowledgement, quella voce
-rimane nella finestra.
-
-**Cosa potrebbe violarla.** Un client che invia `N+1` nuove richieste
-logiche prima di completare il retry della prima causa l'eviction di quella
-prima voce. Il retry successivo riceverà `ERR request_id_expired`. Questo
-è dichiarato nel contratto come condizione fuori dalla garanzia: è una
-violazione del protocollo lato client, non un difetto del server.
+**Proprietà.** Un client riceverà sempre la risposta cached (senza side-effect ripetuti) purché non faccia avanzare il proprio `seq` di più di `N` (window size) posizioni senza aver prima ricevuto l'acknowledgement della prima richiesta.
 
 ---
 
-### L4 — Errori terminali non bloccano il servizio
+### L4 — Liveness dei Lock nel Sistema Distribuito
 
-**Proprietà.** Richieste malformate, in conflitto o fuori finestra non bloccano il server.
+**Proprietà.** Il sistema minimizza i punti di contesa globale, garantendo parallelismo massivo.
 
-Il server restituisce un errore esplicito e termina la gestione della richiesta:
+**Perché vale.**
 
-```text
-ERR malformed
-ERR bad_request_id
-ERR request_id_conflict
-ERR request_id_expired
-```
-
-Non ci sono attese su risorse esterne, consenso distribuito o retry automatici interni.
+* **Sul Router:** I `client_lock` isolano le sessioni. L'incremento del Sequence Number globale usa un lock velocissimo (`_version_lock`) isolato dall'I/O di rete. Le richieste di client diversi non si bloccano mai a vicenda.
+* **Sugli ShardNode:** Le scritture e letture sono protette da `key_locks` specifici per singola chiave. Milioni di chiavi diverse possono essere aggiornate in parallelo senza contesa.
 
 ---
-
-### L5 — Operazioni concorrenti non creano colli di bottiglia globali (Liveness dei Lock)
-
-**Proprietà.** Richieste inviate da client diversi, o dirette verso chiavi diverse da client diversi, procedono in pieno parallelismo senza bloccarsi a vicenda.
-
-**Perché vale.** Il sistema non utilizza un singolo lock globale transazionale, ma delega il blocco a una strategia a grana fine (_client_locks e _key_locks). Il lock globale (_meta_lock) viene trattenuto per un tempo microscopico, solo per allocare e recuperare l'oggetto lock dal dizionario. Di conseguenza:
-- Due client che operano in simultanea su chiavi diverse non subiscono alcuna contesa di blocco (liveness massima).
-- Due client che operano sulla stessa chiave competono solo sull'acquisizione del key_lock, per il tempo strettamente necessario a calcolare la nuova versione.
-
-**Cosa potrebbe violarla.** L'uso di un singolo lock globale per l'intera sequenza di lookup, validazione, scrittura e cache azzererebbe il parallelismo, costringendo tutti i client a mettersi in fila indiana per accedere al database (violazione della liveness prestazionale sotto stress).
 
 ## Limiti dichiarati
 
 ### Nessuna persistenza
 
-Store e request table sono solo in memoria. Dopo un riavvio, il server perde sia i dati sia le risposte cached.
+Router e ShardNode operano in RAM. Un riavvio azzera i dati (ShardNode) e la tabella di idempotenza (Router). Le garanzie non sopravvivono a un crash completo del processo.
 
-Conseguenza: un retry precedente al riavvio può essere trattato come prima esecuzione.
+### Limitazioni del Sequence Number Globale
 
----
+Il Router centralizza la generazione delle versioni (`_global_version`). In sistemi su scala planetaria, questo formerebbe un collo di bottiglia prestazionale (si prediligono clock vettoriali o timestamp HLC), ma è accettabile nell'ambito del presente protocollo.
 
-### Nessuna exactly-once distribuita
+### Nessuna Autenticazione
 
-Il progetto garantisce **at-most-once execution locale entro finestra**.
-
-Non garantisce:
-
-- exactly-once distribuita;
-- consenso;
-- replica;
-- recovery idempotente dopo crash;
-- ordinamento globale tra client diversi.
-
----
-
-### Nessuna autenticazione del client_id
-
-Il server accetta il `client_id` dichiarato dal client. Un client malevolo potrebbe dichiarare l'identità di un altro client.
-
-Questo è fuori dal contratto corrente.
-
----
-
-## Conclusione
-
-Il progetto garantisce che una richiesta mutativa ben formata, identificata da `(client_id, seq)`, produca il proprio effetto al massimo una volta entro la finestra mantenuta dal server.
-
-La garanzia si basa su:
-
-```text
-request_id
-payload canonico
-response cached
-lock sulla sezione check-then-apply
-sliding window
-eviction boundary
-```
-
-Questa combinazione rende sicuro il retry locale entro una singola istanza server e rende esplicite le condizioni fuori garanzia.
+Il Router si fida ciecamente del `client_id` dichiarato. La "spoofing" dell'identità non è mitigata a livello applicativo.

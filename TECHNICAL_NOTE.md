@@ -1,183 +1,100 @@
 ﻿# Nota Tecnica: Scelte di Design, Limiti e Possibili Evoluzioni
 
-Questo documento descrive i trade-off accettati nella progettazione del
-protocollo di retry idempotenti, i limiti che rimangono nella versione corrente,
-e le evoluzioni possibili discusse ma non implementate.
+Questo documento descrive i trade-off accettati nella progettazione del protocollo del **KV Store Distribuito con Gateway, Rebalancing e Retry Idempotenti**, i limiti che rimangono nella versione corrente e le evoluzioni possibili per scenari di produzione reali.
 
-Il sistema implementato è un server TCP single-node, multithread, con stato in memoria e operazioni mutative idempotenti.
+Il sistema implementato è un'architettura distribuita composta da un **Router** (Gateway stateless rispetto ai dati, ma stateful per l'idempotenza e la topologia), un **Coordinator** (motore di migrazione) e molteplici **ShardNode** (nodi di storage in memoria).
 
 ---
 
 ## Il Problema Centrale
 
-In un sistema distribuito un client non può distinguere tra tre scenari
-dopo un timeout su una scrittura:
+In un sistema distribuito, le incertezze di rete si moltiplicano. Un client non può distinguere tra vari scenari dopo un timeout su una scrittura, e senza idempotenza un retry rischia di produrre un **doppio effetto**.
 
-1. Il server non ha mai ricevuto la richiesta.
-2. Il server ha ricevuto e applicato la richiesta, ma la risposta è andata persa.
-3. Il server ha ricevuto la richiesta ma ha fallito prima di applicarla.
+A questo si aggiunge la necessità di **scalare orizzontalmente** (aggiungere/rimuovere nodi) senza disservizi. Durante un rebalancing, i dati si spostano, e una richiesta (nuova o ritentata) deve essere instradata correttamente senza che il client legga dati vecchi o scriva su nodi non più competenti.
 
-Senza idempotenza, un retry nel caso 2 produce un **doppio effetto**: un valore
-scritto due volte, una versione incrementata due volte. Il meccanismo del
-`request_id` converte un'operazione potenzialmente duplicata in un'operazione
-probabilmente singola.
-
-Esempio:
-
-```text
-SET corso ads   -> OK version=0   (risposta persa)
-SET corso ads   -> OK version=1   (retry trattato come nuova scrittura)
-```
-
-Il valore finale può sembrare corretto, ma la versione è stata incrementata due volte.
-
-> La promessa introdotta è: un `SET_REQ`, `CAS_REQ` o `DELETE_REQ` con un
-> dato `request_id` applica il proprio effetto allo store **al più una volta**,
-> e i retry successivi ricevono la stessa risposta della prima esecuzione.
+> La promessa del sistema è: un `SET_REQ`, `CAS_REQ` o `DELETE_REQ` applica il proprio effetto allo store **al più una volta**. Il Router maschera interamente la complessità della topologia e del rebalancing, offrendo un'interfaccia lineare e coerente.
 
 ---
 
 ## Costi Accettati
 
-| Costo                        | Descrizione                                                                                              |
-| ---------------------------- | -------------------------------------------------------------------------------------------------------- |
-| Memoria aggiuntiva           | Il server mantiene una request table per client, limitata a N voci. Non è zero, ma è bounded.          |
-| Latenza leggermente maggiore | Ogni operazione mutativa esegue 2 lookup aggiuntivi nel dizionario (lettura e scrittura), entrambi O(1). |
-| Complessità del Locking    | L'uso di lock a grana fine (client_lock -> key_lock) massimizza le prestazioni, ma richiede un'acquisizione gerarchica rigorosa per prevenire deadlock.               |
-| Onere lato client            | Il client deve generare e tracciare i valori di`seq`. Il server non offre aiuto in questa scelta.      |
+| Costo | Descrizione |
+| :--- | :--- |
+| **Memoria aggiuntiva sul Gateway** | Il Router mantiene una request table per client, limitata a N voci (sliding window). |
+| **Overhead di Rete** | Ogni operazione mutativa richiede almeno un hop di rete interno (Router → ShardNode). Il Router apre e chiude connessioni TCP sincrone verso i nodi dati per ogni comando, impattando la latenza. |
+| **Collo di Bottiglia Globale** | Il Router calcola centralmente il Sequence Number globale. Questo limita le scritture massime teoriche del cluster alle prestazioni di calcolo/lock del Router stesso. |
+| **Complessità Architetturale** | La migrazione a caldo richiede fallback in lettura, blocchi mirati (CAS sospese durante il rebalance) e l'uso di Tombstone logici per la coerenza. |
 
 ---
 
 ## Strategia di Garbage Collection: Sliding Window
 
-### Strategie considerate
+La gestione della memoria per la request table sul **Router** segue la logica della Sliding Window con un *eviction boundary* (`_eviction_boundary`).
 
-| Strategia                         | Memoria                 | Rischio correttezza                | Complessità |
-| --------------------------------- | ----------------------- | ---------------------------------- | ------------ |
-| Conserva tutte le voci per sempre | Illimitata              | Nessuno                            | Minima       |
-| Scadenza temporale (TTL)          | Limitata nel tempo      | Dipende dalle assunzioni sul clock | Media        |
-| Sliding window (scelta)           | Limitata per conteggio  | Richiede disciplina del client     | Bassa        |
-| ACK cumulativo esplicito          | Limitata esplicitamente | Richiede un round-trip aggiuntivo  | Media        |
-
-### Perché la sliding window
-
-La sliding window è stata scelta perché:
-
-- non richiede infrastruttura di clock o timer;
-- fornisce un confine chiaro e testabile: esattamente `N` voci per client;
-- il costo di eviction è O(1) per operazione, inline, senza background thread.
-
-Il **rischio principale** della sliding window è che la dimensione della
-finestra `N` diventa parte implicita del contratto client-server. Un client
-che invia `N+1` richieste senza attendere il completamento del retry della
-prima rompe silenziosamente la garanzia. Questo è dichiarato esplicitamente
-nel contratto.
-
-### Il ruolo dell'eviction boundary
-
-La sliding window da sola non è sufficiente. Quando un `seq` non è presente
-nella finestra, il server deve distinguere tra:
-
-- `seq` **mai visto**: prima richiesta legittima → eseguire;
-- `seq` **già evictato**: retry fuori finestra → `ERR request_id_expired`.
-
-Senza un campo aggiuntivo, i due casi sarebbero indistinguibili. L'**eviction
-boundary** (low-watermark) risolve il problema: tiene traccia del massimo `seq`
-mai evictato per ogni client. La logica di controllo diventa:
-
-```
-se seq è in finestra           → replay
-se seq <= eviction_boundary    → ERR request_id_expired
-altrimenti                     → prima esecuzione
-```
-
-Se un `client_id` non ha mai subito eviction, `eviction_boundary` è
-considerato -1: nessuna prima richiesta valida (con `seq >= 0`) viene
-erroneamente rifiutata come scaduta.
+Questa scelta è stata mantenuta rispetto al sistema a nodo singolo perché:
+- Non richiede infrastruttura di clock o timer distribuiti.
+- Il costo di eviction è O(1) per operazione, eseguito *inline* sul Router senza background thread.
+- Definisce un contratto rigoroso col client: se il client avanza di più di `N` richieste senza attendere gli ACK, i retry delle richieste vecchie verranno rigettati in modo sicuro e deterministico (`ERR_REQUEST_ID_EXPIRED`).
 
 ---
 
-## Design del Lock (Grana Fine a Due Livelli)
+## Design del Lock, Rebalancing e Architettura Distribuita
 
-Invece di usare un singolo lock globale transazionale che costringerebbe tutte le operazioni mutative a serializzarsi globalmente abbattendo il parallelismo, il sistema utilizza una strategia di locking a grana fine a due livelli.
+L'architettura ha richiesto una riprogettazione totale dei lock, dividendoli tra i componenti del sistema per massimizzare la Liveness.
 
-L'acquisizione dei lock avviene in un ordine rigoroso e immutabile (prevenzione Deadlock):
-- **client_lock**: Acquisito per primo, isola tutte le richieste concorrenti provenienti o facenti finta di provenire dallo stesso client_id. Sotto questo lock avviene il controllo nella request table: se si tratta di un retry, l'esecuzione si ferma e si restituisce la risposta in cache.
-- **key_lock**: Se la richiesta è inedita, si acquisisce il lock specifico per la singola chiave, permettendo al client di applicare l'effetto allo store senza bloccare le altre chiavi usate da altri client nel frattempo.
-- **store_structure_lock**: Acquisito (sotto al key_lock) solo quando si altera strutturalmente il dizionario globale (creazione o eliminazione di una chiave).
+### Sul Router (Gateway)
+- **`client_lock`:** Isola le richieste dello stesso client. Include la verifica in cache, l'inoltro sincrono della chiamata di rete verso lo ShardNode e il salvataggio della risposta. Questo garantisce che due retry identici concorrenti non inneschino mai due chiamate di rete verso i nodi dati.
+- **`_version_lock`:** Lock microscopico e rapidissimo per incrementare il Sequence Number globale per le mutazioni.
+- **`_topology_lock`:** Protegge la topologia di routing. Viene acquisito per istanti brevissimi (es. in `_routing_snapshot()`) in modo lock-free rispetto all'I/O di rete, per decidere dove inviare i dati senza bloccare il traffico globale.
 
-
-Separare i lock introdurrebbe una finestra di vulnerabilità (due thread superano la validazione e scrivono 2 volte la stessa cosa) se non fosse gestito correttamente. 
-
-Tuttavia, poiché il client_lock abbraccia l'intera transazione dalla validazione al calcolo, fino al salvataggio in cache della risposta, il primo thread eseguirà l'intera catena di lavoro mentre il secondo (identico) attenderà. 
-
-Al rilascio del client_lock, il secondo thread troverà la risposta già calcolata nella request table, garantendo l'idempotenza assoluta senza sacrificare la scalabilità globale del sistema.
+### Sugli ShardNode (Data Plane)
+- **`key_lock` e `structure_lock`:** Gli ShardNode ignorano client e topologie. Proteggono semplicemente l'integrità del dizionario locale a grana fine per chiave, garantendo altissimo parallelismo.
 
 ---
 
-## Versioni e CAS
+## Sequence Number Globale e Tombstone
 
-Ogni chiave ha una versione locale.
+A differenza del sistema a nodo singolo (dove le versioni erano locali alla chiave e resettate alla cancellazione), in un sistema distribuito con migrazioni questo approccio causa la **corruzione dei dati (Zombie Data)**.
 
-Regole:
-
-```text
-chiave assente                  -> versione implicita -1
-prima SET_REQ su chiave assente -> version=0
-scrittura successiva            -> version+1
-DELETE_REQ                      -> rimuove la chiave
-SET_REQ dopo DELETE_REQ         -> riparte da version=0
-```
-
-`CAS_REQ` aggiorna una chiave solo se la versione corrente coincide con quella attesa.
-
-Anche una `CAS_REQ` fallita per `version_mismatch` viene salvata nella request table, così il retry restituisce lo stesso errore.
+**Regole Distribuite:**
+1. **Versione Globale:** Il Router assegna una versione strettamente crescente ad ogni scrittura. Lo ShardNode accetta la scrittura solo se la versione in ingresso è `> ` della versione attualmente memorizzata.
+2. **Tombstone logici:** Il comando `DELETE_REQ` non rimuove fisicamente la chiave, ma scrive un valore sentinella `<TOMBSTONE>` con una versione globale incrementata.
+3. **Lettura con Fallback:** Durante un rebalance, il Router legge prima dal nodo *nuovo* e poi dal nodo *vecchio*. Se il Router trovasse una chiave assente sul nodo nuovo, farebbe fallback sul vecchio, **resuscitando** un dato appena cancellato. Il Tombstone sul nodo nuovo blocca il fallback: informa il Router che il dato è esplicitamente assente. Il cleanup fisico avviene solo a rebalance concluso, in modo asincrono.
 
 ---
 
-## Scelte Lasciate all'Implementatore
+## Migrazione Sicura (Two-Phase Commit)
 
-Le seguenti scelte sono libere, purché documentate:
+Per garantire la Safety in caso di guasti hardware durante il rebalancing, il Coordinator usa un pattern in 3 step:
+1. **Prepare:** Copia i dati dai vecchi ai nuovi shard. Nessun dato originale viene cancellato.
+2. **Commit:** Invia `ACK_REBALANCE_END` al Router, che accetta la topologia.
+3. **Cleanup:** Il Coordinator elimina le copie vecchie.
 
-| Scelta                              | Valore scelto                | Motivazione                                                                                |
-| ----------------------------------- | ---------------------------- | ------------------------------------------------------------------------------------------ |
-| Window size N                       | 100                          | Valore di default; configurabile. Bilanciamento tra memoria usata e durata della garanzia. |
-| Implementazione del comando`ACK`  | Non implementato (opzionale) | Aggiunge complessità semantica non necessaria per la versione base.                       |
-| Accettazione di`seq` non monotoni | Accettati                    | Il contratto non li vieta; la window sliding può evictarli prima del previsto.            |
+Se il Coordinator o la rete falliscono nelle prime due fasi, un **Watchdog** sul Router si accorge del timeout e abortisce la migrazione, ripristinando la vecchia topologia. Poiché la Fase 3 non era ancora iniziata, nessun dato è andato perso.
 
 ---
 
 ## Limiti della Versione Corrente
 
-| Limite                                  | Descrizione                                                                                                                                                 |
-| --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Nessuna persistenza                     | La request table e il KV store sono in memoria. Un riavvio del server azzera tutto. Un retry dopo il riavvio viene trattato come prima esecuzione.          |
-| Nessuna autenticazione del`client_id` | Il server accetta il`client_id` dichiarato dal client senza verifica. Un client malintenzionato può impersonare un altro.                                |
-| Single-node                             | La garanzia di idempotenza è locale a una singola istanza del server. In un sistema replicato, la request table dovrebbe essere replicata o centralizzata. |
-| `N` è un parametro statico           | Modificare la window size richiede il riavvio del server e la consapevolezza coordinata dei client.                                                         |
+| Limite | Descrizione |
+| :--- | :--- |
+| **Nessuna Persistenza** | L'intero cluster gira in RAM. Un crash di uno ShardNode comporta la perdita della sua partizione di dati. Un crash del Router azzera la request table, rompendo la garanzia di idempotenza per le richieste in volo al momento del crash. |
+| **Router come SPOF** | Il Router è un Single Point of Failure (SPOF) sia per la raggiungibilità del sistema sia per il collo di bottiglia generato dal `_version_lock` globale. |
+| **Overhead TCP (`send_line`)** | L'apertura e chiusura di un socket TCP per ogni singolo comando interno Router ↔ ShardNode consuma porte effimere e devasta il throughput massimo. |
+| **Hashing Modulo (N)** | L'assegnazione delle chiavi usa `hash(key) % N`. Aggiungere un nodo rimescola una quantità massiccia di chiavi in tutto il cluster, saturando la rete durante il rebalance. |
 
 ---
 
-## Possibili Evoluzioni
+## Possibili Evoluzioni (Produzione)
 
-### Persistenza della request table
+### 1. Consistent Hashing (Topologia ad Anello)
+Sostituire il semplice modulo con il Consistent Hashing (es. Hash Ring) ridurrebbe drasticamente la quantità di dati da migrare durante l'aggiunta o rimozione di un nodo (solo le chiavi nell'arco di anello adiacente si sposterebbero, non l'intero database).
 
-Scrivere ogni nuova voce della request table su un append-only log prima
-di rispondere al client. Al riavvio, replay del log per ricostruire la
-tabella. Questo renderebbe la garanzia di idempotenza sopravvivere ai crash
-del server, al costo di un'operazione di I/O su ogni operazione mutativa.
+### 2. Versionamento Distribuito (HLC / Vector Clocks)
+Rimuovere il `_global_version` dal Router. Demandare il versionamento a clock ibridi logico-fisici (Hybrid Logical Clocks) generati dai nodi o timestamps locali per partizione, eliminando il collo di bottiglia globale delle scritture.
 
-### ACK cumulativo
+### 3. Connection Pooling / Keep-Alive
+Introdurre un pool di connessioni persistenti sul Router (es. tramite HTTP/2 multiplexing, gRPC o connessioni TCP riutilizzabili) per azzerare la latenza di handshake e teardown dei socket verso gli ShardNode.
 
-Il comando `ACK <client_id> <seq>` (già descritto nel contratto come
-estensione opzionale) permette al client di liberare esplicitamente le voci
-dalla finestra. Questo rimuove il vincolo implicito sulla dimensione della
-finestra e rende il protocollo di pulizia esplicito, ma richiede un round-trip
-aggiuntivo e complessità semantica in presenza di retry ancora in volo.
-
-### Idempotenza distribuita
-
-In un sistema replicato o shardato, la request table deve essere replicata
-o collocata su un coordinatore che tutte le repliche consultano. Questo è
-il problema dell'"exactly-once" distribuito e richiede coordinamento a livello
-di consenso.
+### 4. High Availability del Router (Raft/Paxos)
+Rendere il Router replicato. Utilizzare un protocollo di consenso come Raft per mantenere sincronizzata la `request_table` e lo stato della topologia su un cluster di 3 o 5 Router, garantendo idempotenza e operatività anche se il Router primario esplode.
