@@ -43,7 +43,7 @@ Il valore finale può sembrare corretto, ma la versione è stata incrementata du
 | ---------------------------- | -------------------------------------------------------------------------------------------------------- |
 | Memoria aggiuntiva           | Il server mantiene una request table per client, limitata a N voci. Non è zero, ma è bounded.          |
 | Latenza leggermente maggiore | Ogni operazione mutativa esegue 2 lookup aggiuntivi nel dizionario (lettura e scrittura), entrambi O(1). |
-| Lock contention aumentata    | La request table condivide il lock dello store. Tutte le operazioni mutative serializzano.               |
+| Complessità del Locking    | L'uso di lock a grana fine (client_lock -> key_lock) massimizza le prestazioni, ma richiede un'acquisizione gerarchica rigorosa per prevenire deadlock.               |
 | Onere lato client            | Il client deve generare e tracciare i valori di`seq`. Il server non offre aiuto in questa scelta.      |
 
 ---
@@ -81,7 +81,7 @@ nella finestra, il server deve distinguere tra:
 - `seq` **mai visto**: prima richiesta legittima → eseguire;
 - `seq` **già evictato**: retry fuori finestra → `ERR request_id_expired`.
 
-Senza un campo aggiuntivo, i due ==casi==i sarebbero indistinguibili. L'**eviction
+Senza un campo aggiuntivo, i due casi sarebbero indistinguibili. L'**eviction
 boundary** (low-watermark) risolve il problema: tiene traccia del massimo `seq`
 mai evictato per ogni client. La logica di controllo diventa:
 
@@ -97,14 +97,21 @@ erroneamente rifiutata come scaduta.
 
 ---
 
-## Design del Lock
+## Design del Lock (Grana Fine a Due Livelli)
 
-Un unico `threading.Lock` protegge sia `_data` (il KV store) sia la request table. Questa scelta è intenzionale: il lookup, la scrittura sullo store e la memorizzazione della risposta devono apparire atomici rispetto ai thread concorrenti.
+Invece di usare un singolo lock globale transazionale che costringerebbe tutte le operazioni mutative a serializzarsi globalmente abbattendo il parallelismo, il sistema utilizza una strategia di locking a grana fine a due livelli.
 
-Separare il lock dello store dal lock della request table introdurrebbe una finestra in cui due thread potrebbero entrambi superare il controllo sulla request table e applicare l'effetto due volte, violando S1.
+L'acquisizione dei lock avviene in un ordine rigoroso e immutabile (prevenzione Deadlock):
+- **client_lock**: Acquisito per primo, isola tutte le richieste concorrenti provenienti o facenti finta di provenire dallo stesso client_id. Sotto questo lock avviene il controllo nella request table: se si tratta di un retry, l'esecuzione si ferma e si restituisce la risposta in cache.
+- **key_lock**: Se la richiesta è inedita, si acquisisce il lock specifico per la singola chiave, permettendo al client di applicare l'effetto allo store senza bloccare le altre chiavi usate da altri client nel frattempo.
+- **store_structure_lock**: Acquisito (sotto al key_lock) solo quando si altera strutturalmente il dizionario globale (creazione o eliminazione di una chiave).
 
-Il costo è che tutte le operazioni mutative serializzano globalmente. Per
-un'implementazione didattica con un numero limitato di client concorrenti, questo è accettabile.
+
+Separare i lock introdurrebbe una finestra di vulnerabilità (due thread superano la validazione e scrivono 2 volte la stessa cosa) se non fosse gestito correttamente. 
+
+Tuttavia, poiché il client_lock abbraccia l'intera transazione dalla validazione al calcolo, fino al salvataggio in cache della risposta, il primo thread eseguirà l'intera catena di lavoro mentre il secondo (identico) attenderà. 
+
+Al rilascio del client_lock, il secondo thread troverà la risposta già calcolata nella request table, garantendo l'idempotenza assoluta senza sacrificare la scalabilità globale del sistema.
 
 ---
 
@@ -168,16 +175,9 @@ dalla finestra. Questo rimuove il vincolo implicito sulla dimensione della
 finestra e rende il protocollo di pulizia esplicito, ma richiede un round-trip
 aggiuntivo e complessità semantica in presenza di retry ancora in volo.
 
-### Lock per client
-
-Sostituire il lock globale con un lock per `client_id` sulla request table,
-combinato con un lock per chiave sullo store. Aumenta il parallelismo tra
-client diversi, ma richiede un ordinamento disciplinato delle acquisizioni
-per evitare deadlock.
-
 ### Idempotenza distribuita
 
 In un sistema replicato o shardato, la request table deve essere replicata
 o collocata su un coordinatore che tutte le repliche consultano. Questo è
 il problema dell'"exactly-once" distribuito e richiede coordinamento a livello
-di consenso (Paxos, Raft).
+di consenso.

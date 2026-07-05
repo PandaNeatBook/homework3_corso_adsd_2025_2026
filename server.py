@@ -1,323 +1,346 @@
-#!/usr/bin/env python3
-from __future__ import annotations
-
-import argparse
-import socket
 import threading
+import socket
 from dataclasses import dataclass
-from typing import Callable
 
 
 @dataclass
 class ValueRecord:
+    """Rappresenta il valore memorizzato nel database e la sua versione corrente."""
     value: str
     version: int
 
 
 @dataclass
 class RequestRecord:
+    """Memorizza lo stato di una richiesta passata per garantire l'idempotenza in caso di retry."""
     payload: str
     response: str
 
 
 class KVStore:
+    """
+    Core del Key-Value Store in-memory, thread-safe.
+    Supporta operazioni concorrenti e garantisce l'idempotenza delle operazioni mutative
+    tramite un sistema di Request ID basato su (client_id, sequence_number).
+    """
+
     def __init__(self, request_window_size: int = 100) -> None:
         if request_window_size < 1:
             raise ValueError("request_window_size must be >= 1")
+
+        # Stato dell'applicazione
         self._data: dict[str, ValueRecord] = {}
+
+        # Cache per l'idempotenza: mappa client_id -> (sequence_number -> RequestRecord)
         self._requests: dict[str, dict[int, RequestRecord]] = {}
+
+        # Tracking per l'eviction: l'ultimo sequence_number eliminato per ogni client
         self._evicted_until: dict[str, int] = {}
         self._window = request_window_size
-        self._lock = threading.Lock()
 
-    def handle_line(self, raw_line: str) -> str:
-        line = raw_line.rstrip("\r\n")
-        if not line.strip():
+        # --- GESTIONE DEI LOCK (Concurrency Control) ---
+        # Usiamo una strategia di locking a due livelli per massimizzare la liveness (parallelismo).
+
+        # 1. Lock Globale (Meta-lock): Usato solo per proteggere i dizionari che contengono i lock stessi.
+        self._meta_lock = threading.Lock()
+
+        # 2. Lock a Grana Fine: Un lock per ogni specifico client e uno per ogni specifica chiave.
+        # Questo permette a thread che operano su chiavi/client diversi di non bloccarsi a vicenda.
+        self._client_locks: dict[str, threading.Lock] = {}
+        self._key_locks: dict[str, threading.Lock] = {}
+
+        # 3. Lock Strutturale: Usato per operazioni che alterano la dimensione/struttura di _data (es. DELETE, KEYS, STATS)
+        self._store_structure_lock = threading.Lock()
+
+    def _get_client_lock(self, client_id: str) -> threading.Lock:
+        """Restituisce (o crea lazy) il lock associato a uno specifico client."""
+        with self._meta_lock:
+            if client_id not in self._client_locks:
+                self._client_locks[client_id] = threading.Lock()
+            return self._client_locks[client_id]
+
+    def _get_key_lock(self, key: str) -> threading.Lock:
+        """Restituisce (o crea lazy) il lock associato a una specifica chiave."""
+        with self._meta_lock:
+            if key not in self._key_locks:
+                self._key_locks[key] = threading.Lock()
+            return self._key_locks[key]
+
+    def handle_line(self, line: str) -> str:
+        """
+        Processa un singolo comando stringa e restituisce la risposta.
+        Tutta la logica di business transazionale si trova qui.
+        """
+        # Pre-validazione veloce fuori dai lock per massimizzare le prestazioni.
+        stripped = line.strip()
+        if not stripped:
             return "ERR empty_command"
 
-        cmd = line.split(maxsplit=1)[0].upper()
-        try:
-            if cmd == "PING":
-                return self._zero_arg(line, "OK PONG")
-            if cmd == "QUIT":
-                return self._zero_arg(line, "OK BYE")
-            if cmd == "GET":
-                return self._get(line, versioned=False)
-            if cmd == "GETV":
-                return self._get(line, versioned=True)
-            if cmd == "EXISTS":
-                return self._exists(line)
-            if cmd == "KEYS":
-                return self._keys(line)
-            if cmd == "STATS":
-                return self._stats(line)
+        parts = stripped.split(maxsplit=1)
+        cmd = parts[0].upper()
+        args_str = parts[1] if len(parts) > 1 else ""
+
+        # ==========================================
+        # COMANDI DI LETTURA (Non mutativi)
+        # ==========================================
+        if cmd == "PING":
+            if args_str:
+                return "ERR usage: PING"
+            return "OK PONG"
+
+        elif cmd == "GET":
+            if not args_str or len(args_str.split()) != 1:
+                return "ERR usage: GET <key>"
+            key = args_str.strip()
+            key_lock = self._get_key_lock(key)
+
+            # Acquisiamo il lock specifico della chiave in lettura per evitare dati parziali
+            with key_lock:
+                record = self._data.get(key)
+                if record is None:
+                    return "NOT_FOUND"
+                return f"OK {record.value}"
+
+        elif cmd == "GETV":
+            if not args_str or len(args_str.split()) != 1:
+                return "ERR usage: GETV <key>"
+            key = args_str.strip()
+            key_lock = self._get_key_lock(key)
+
+            with key_lock:
+                record = self._data.get(key)
+                if record is None:
+                    return "NOT_FOUND"
+                return f"OK version={record.version} {record.value}"
+
+        elif cmd == "EXISTS":
+            if not args_str or len(args_str.split()) != 1:
+                return "ERR usage: EXISTS <key>"
+            key = args_str.strip()
+            key_lock = self._get_key_lock(key)
+
+            with key_lock:
+                exists = key in self._data
+                return f"OK {1 if exists else 0}"
+
+        elif cmd == "KEYS":
+            if args_str:
+                return "ERR usage: KEYS"
+            # KEYS richiede una iterazione su tutto il dizionario, blocchiamo la struttura
+            with self._store_structure_lock:
+                if not self._data:
+                    return "OK"
+                sorted_keys = sorted(self._data.keys())
+                return f"OK {' '.join(sorted_keys)}"
+
+        elif cmd == "STATS":
+            if args_str:
+                return "ERR usage: STATS"
+            with self._store_structure_lock:
+                keys_count = len(self._data)
+            with self._meta_lock:
+                clients_count = len(self._requests)
+                cached_requests_count = sum(len(self._requests[c]) for c in self._requests)
+            return f"OK keys={keys_count} clients={clients_count} cached_requests={cached_requests_count} window_size={self._window}"
+
+        elif cmd == "QUIT":
+            return "OK BYE"
+
+        # ==========================================
+        # COMANDI MUTATIVI (Richiedono Idempotenza)
+        # ==========================================
+        elif cmd in ("SET_REQ", "CAS_REQ", "DELETE_REQ"):
+
+            # 1. Parsing Sintattico specifico per comando
             if cmd == "SET_REQ":
-                return self._set_req(line)
-            if cmd == "CAS_REQ":
-                return self._cas_req(line)
-            if cmd == "DELETE_REQ":
-                return self._delete_req(line)
-            if cmd == "SET":
-                return self._set(line)
-            if cmd == "CAS":
-                return self._cas(line)
-            if cmd == "DELETE":
-                return self._delete(line)
-            return "ERR unknown_command"
-        except ValueError as exc:
-            return f"ERR {exc}"
+                tokens = args_str.split(maxsplit=2)
+                if len(tokens) < 3:
+                    return "ERR usage: SET_REQ <request_id> <key> <value...>"
+                req_id, key, value = tokens[0], tokens[1], tokens[2]
+                payload_canonico = f"SET_REQ {key} {value}"
 
-    @staticmethod
-    def _zero_arg(line: str, response: str) -> str:
-        parts = line.split()
-        return response if len(parts) == 1 else f"ERR usage: {parts[0].upper()}"
+            elif cmd == "CAS_REQ":
+                tokens = args_str.split(maxsplit=3)
+                if len(tokens) < 4:
+                    return "ERR usage: CAS_REQ <request_id> <key> <expected_version> <value...>"
+                req_id, key, expected_version_str, value = tokens[0], tokens[1], tokens[2], tokens[3]
+                try:
+                    expected_version = int(expected_version_str)
+                    if expected_version < 0:
+                        raise ValueError()
+                except ValueError:
+                    return "ERR bad_version"
+                payload_canonico = f"CAS_REQ {key} {expected_version} {value}"
 
-    @staticmethod
-    def _check_key(key: str) -> None:
-        if not key or any(ch.isspace() for ch in key):
-            raise ValueError("bad_key")
+            elif cmd == "DELETE_REQ":
+                tokens = args_str.split()
+                if len(tokens) != 2:
+                    return "ERR usage: DELETE_REQ <request_id> <key>"
+                req_id, key = tokens[0], tokens[1]
+                payload_canonico = f"DELETE_REQ {key}"
 
-    @staticmethod
-    def _parse_int(text: str, error: str) -> int:
-        try:
-            return int(text)
-        except ValueError as exc:
-            raise ValueError(error) from exc
+            # 2. Validazione del Request ID
+            if ":" not in req_id:
+                return "ERR invalid_request_id"
+            client_id, seq_str = req_id.split(":", 1)
+            if not client_id:
+                return "ERR invalid_request_id"
+            try:
+                seq = int(seq_str)
+                if seq < 0:
+                    raise ValueError()
+            except ValueError:
+                return "ERR invalid_request_id"
 
-    @classmethod
-    def _parse_request_id(cls, request_id: str) -> tuple[str, int]:
-        if ":" not in request_id:
-            raise ValueError("invalid_request_id")
-        client_id, seq_text = request_id.rsplit(":", 1)
-        if not client_id or ":" in client_id or any(ch.isspace() for ch in client_id):
-            raise ValueError("invalid_request_id")
-        seq = cls._parse_int(seq_text, "invalid_request_id")
-        if seq < 0:
-            raise ValueError("invalid_request_id")
-        return client_id, seq
+            # 3. Transazione Idempotente - Acquisizione lock del client
+            # NOTA: Per evitare deadlock, acquisiamo SEMPRE prima il lock del client, poi quello della chiave.
+            client_lock = self._get_client_lock(client_id)
+            with client_lock:
 
-    def _get(self, line: str, versioned: bool) -> str:
-        parts = line.split()
-        if len(parts) != 2:
-            return f"ERR usage: {parts[0].upper()} <key>"
-        key = parts[1]
-        self._check_key(key)
-        with self._lock:
-            rec = self._data.get(key)
-        if rec is None:
-            return "NOT_FOUND"
-        return f"OK version={rec.version} {rec.value}" if versioned else f"OK {rec.value}"
+                # FASE A: Verifica della finestra di Eviction (Garbage Collection check)
+                # Controlliamo se la richiesta è troppo vecchia e la sua cache è già stata svuotata
+                eviction_boundary = self._evicted_until.get(client_id, -1)
+                if seq <= eviction_boundary:
+                    return "ERR request_id_expired"
 
-    def _exists(self, line: str) -> str:
-        parts = line.split()
-        if len(parts) != 2:
-            return "ERR usage: EXISTS <key>"
-        key = parts[1]
-        self._check_key(key)
-        with self._lock:
-            exists = key in self._data
-        return f"OK {1 if exists else 0}"
+                # FASE B: Controllo dell'Idempotenza
+                # Se abbiamo già visto questo (client_id, sequence_number), restituiamo la risposta salvata.
+                client_requests = self._requests.setdefault(client_id, {})
+                if seq in client_requests:
+                    record = client_requests[seq]
+                    # Prevenzione di abusi: se lo stesso ID viene riusato per un comando diverso, segnaliamo errore.
+                    if record.payload != payload_canonico:
+                        return "ERR request_id_conflict"
+                    return record.response
 
-    def _keys(self, line: str) -> str:
-        if len(line.split()) != 1:
-            return "ERR usage: KEYS"
-        with self._lock:
-            keys = sorted(self._data)
-        return "OK" if not keys else "OK " + " ".join(keys)
+                # FASE C: Esecuzione Nuova Richiesta - Acquisizione lock della chiave
+                key_lock = self._get_key_lock(key)
+                with key_lock:
+                    if cmd == "SET_REQ":
+                        with self._store_structure_lock:  # Protegge da conflitti con iterazioni strutturali
+                            existing = self._data.get(key)
+                            new_version = 0 if existing is None else existing.version + 1
+                            self._data[key] = ValueRecord(value=value, version=new_version)
+                        response = f"OK version={new_version}"
 
-    def _stats(self, line: str) -> str:
-        if len(line.split()) != 1:
-            return "ERR usage: STATS"
-        with self._lock:
-            nreq = sum(len(t) for t in self._requests.values())
-            return (
-                f"OK keys={len(self._data)} clients={len(self._requests)} "
-                f"cached_requests={nreq} window_size={self._window}"
-            )
+                    elif cmd == "CAS_REQ":
+                        with self._store_structure_lock:
+                            existing = self._data.get(key)
+                            if existing is None:
+                                response = "ERR not_found"
+                            elif existing.version != expected_version:
+                                # Fallimento del Compare-And-Swap
+                                response = f"ERR version_mismatch current={existing.version}"
+                            else:
+                                # Successo del Compare-And-Swap
+                                new_version = existing.version + 1
+                                self._data[key] = ValueRecord(value=value, version=new_version)
+                                response = f"OK version={new_version}"
 
-    def _set_req(self, line: str) -> str:
-        parts = line.split(maxsplit=3)
-        if len(parts) != 4:
-            return "ERR usage: SET_REQ <request_id> <key> <value...>"
-        _, rid, key, value = parts
-        self._check_key(key)
-        client_id, seq = self._parse_request_id(rid)
-        payload = f"SET_REQ\n{client_id}\n{seq}\n{key}\n{value}"
-        return self._idempotent(
-            client_id,
-            seq,
-            payload,
-            lambda: self._apply_set(key, value),
-        )
+                    elif cmd == "DELETE_REQ":
+                        with self._store_structure_lock:
+                            existing = self._data.get(key)
+                            if existing is None:
+                                response = "NOT_FOUND"
+                            else:
+                                del self._data[key]
+                                response = "OK"
 
-    def _cas_req(self, line: str) -> str:
-        parts = line.split(maxsplit=4)
-        if len(parts) != 5:
-            return "ERR usage: CAS_REQ <request_id> <key> <expected_version> <value...>"
-        _, rid, key, expected_text, value = parts
-        self._check_key(key)
-        expected = self._parse_int(expected_text, "bad_version")
-        client_id, seq = self._parse_request_id(rid)
-        payload = f"CAS_REQ\n{client_id}\n{seq}\n{key}\n{expected}\n{value}"
-        return self._idempotent(
-            client_id,
-            seq,
-            payload,
-            lambda: self._apply_cas(key, expected, value),
-        )
+                # FASE D: Salvataggio in cache della risposta
+                # Manteniamo la risposta in modo che futuri retry ricevano l'esito originale senza mutare nuovamente il dato
+                client_requests[seq] = RequestRecord(payload=payload_canonico, response=response)
 
-    def _delete_req(self, line: str) -> str:
-        parts = line.split()
-        if len(parts) != 3:
-            return "ERR usage: DELETE_REQ <request_id> <key>"
-        _, rid, key = parts
-        self._check_key(key)
-        client_id, seq = self._parse_request_id(rid)
-        payload = f"DELETE_REQ\n{client_id}\n{seq}\n{key}"
-        return self._idempotent(
-            client_id,
-            seq,
-            payload,
-            lambda: self._apply_delete(key),
-        )
+                # FASE E: Garbage Collection (Sliding Window)
+                # Se la cache di questo client supera il limite consentito, eliminiamo la richiesta più vecchia.
+                if len(client_requests) > self._window:
+                    min_seq = min(client_requests.keys())
+                    del client_requests[min_seq]
+                    self._evicted_until[client_id] = min_seq
 
-    def _idempotent(
-        self,
-        client_id: str,
-        seq: int,
-        payload: str,
-        apply: Callable[[], str],
-    ) -> str:
-        with self._lock:
-            table = self._requests.setdefault(client_id, {})
-            old = table.get(seq)
+                return response
 
-            if old is not None:
-                if old.payload == payload:
-                    return old.response
-                return "ERR request_id_conflict"
-
-            if seq <= self._evicted_until.get(client_id, -1):
-                return "ERR request_id_expired"
-
-            response = apply()
-            table[seq] = RequestRecord(payload, response)
-
-            while len(table) > self._window:
-                dropped = min(table)
-                del table[dropped]
-                self._evicted_until[client_id] = max(
-                    self._evicted_until.get(client_id, -1),
-                    dropped,
-                )
-
-            return response
-
-    def _set(self, line: str) -> str:
-        parts = line.split(maxsplit=2)
-        if len(parts) != 3:
-            return "ERR usage: SET <key> <value...>"
-        _, key, value = parts
-        self._check_key(key)
-        with self._lock:
-            return self._apply_set(key, value)
-
-    def _cas(self, line: str) -> str:
-        parts = line.split(maxsplit=3)
-        if len(parts) != 4:
-            return "ERR usage: CAS <key> <expected_version> <value...>"
-        _, key, expected_text, value = parts
-        self._check_key(key)
-        expected = self._parse_int(expected_text, "bad_version")
-        with self._lock:
-            return self._apply_cas(key, expected, value)
-
-    def _delete(self, line: str) -> str:
-        parts = line.split()
-        if len(parts) != 2:
-            return "ERR usage: DELETE <key>"
-        key = parts[1]
-        self._check_key(key)
-        with self._lock:
-            return self._apply_delete(key)
-
-    def _apply_set(self, key: str, value: str) -> str:
-        old = self._data.get(key)
-        version = 0 if old is None else old.version + 1
-        self._data[key] = ValueRecord(value, version)
-        return f"OK version={version}"
-
-    def _apply_cas(self, key: str, expected: int, value: str) -> str:
-        old = self._data.get(key)
-        if old is None:
-            return "ERR not_found"
-        if old.version != expected:
-            return f"ERR version_mismatch current={old.version}"
-        version = old.version + 1
-        self._data[key] = ValueRecord(value, version)
-        return f"OK version={version}"
-
-    def _apply_delete(self, key: str) -> str:
-        if key not in self._data:
-            return "NOT_FOUND"
-        del self._data[key]
-        return "OK"
+        # Se il loop arriva fin qui, il comando è sintatticamente inatteso
+        return "ERR unknown_command"
 
 
 class TCPKVServer:
+    """
+    Server TCP concorrente per il KVStore.
+    Utilizza un thread dedicato (Thread-per-connection) per ogni client connesso.
+    """
+
     def __init__(self, host: str, port: int, store: KVStore) -> None:
         self.host = host
         self.port = port
         self.store = store
+        self._server_socket = None
+        self._is_running = False
 
     def serve_forever(self) -> None:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind((self.host, self.port))
-            sock.listen()
-            sock.settimeout(1.0)  # unblock ogni secondo per consegnare Ctrl+C
-            print(f"KV server listening on {self.host}:{self.port}")
+        """Avvia il server per ascoltare le connessioni in ingresso in modo permanente."""
+        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        # SO_REUSEADDR permette il riutilizzo immediato della porta dopo il riavvio del processo
+        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_socket.bind((self.host, self.port))
 
-            while True:
+        # Dimensione della coda dei client in attesa
+        self._server_socket.listen(128)
+        self._is_running = True
+
+        try:
+            while self._is_running:
                 try:
-                    conn, addr = sock.accept()
-                except socket.timeout:
-                    continue  # nessuna connessione in arrivo, riprova
-                threading.Thread(
-                    target=self._handle_client,
-                    args=(conn, addr),
-                    daemon=True,
-                ).start()
+                    # Bloccante finché non arriva un client, o finché shutdown() non chiude il socket
+                    client_sock, _ = self._server_socket.accept()
+                except OSError:
+                    # In caso di shutdown() invocato esternamente, usciamo fluidamente dal ciclo while.
+                    break
 
-    def _handle_client(self, conn: socket.socket, addr: tuple[str, int]) -> None:
-        with conn:
+                # Deleghiamo la gestione di questo specifico client a un thread in background (daemon).
+                t = threading.Thread(target=self._handle_client, args=(client_sock,), daemon=True)
+                t.start()
+        finally:
+            if self._server_socket:
+                try:
+                    self._server_socket.close()
+                except OSError:
+                    pass
+
+    def _handle_client(self, client_sock: socket.socket) -> None:
+        """Loop di lettura delle richieste e invio delle risposte per un singolo client."""
+        try:
+            # .makefile trasforma il raw socket TCP in un file-like object per facilitare la lettura per riga
+            reader = client_sock.makefile('r', encoding='utf-8')
+            writer = client_sock.makefile('w', encoding='utf-8')
+
+            for line in reader:
+                # Passiamo l'esecuzione della logica al nostro Store
+                response = self.store.handle_line(line)
+
+                # Scrittura e flushing istantaneo per reattività
+                writer.write(response + "\n")
+                writer.flush()
+
+                # Gestione disconnessione graziosa
+                if response == "OK BYE":
+                    break
+        except Exception:
+            # Ignoriamo le ConnectionResetError dovute a chiusure improvvise dei client (broken pipe)
+            pass
+        finally:
             try:
-                for line in conn.makefile("r", encoding="utf-8", newline="\n"):
-                    response = self.store.handle_line(line)
-                    conn.sendall((response + "\n").encode("utf-8"))
-                    if response == "OK BYE":
-                        break
+                client_sock.close()
             except OSError:
                 pass
 
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--host", default="127.0.0.1")
-    parser.add_argument("--port", type=int, default=6379)
-    parser.add_argument("--request-window-size", type=int, default=100)
-    return parser.parse_args()
-
-
-def main() -> None:
-    args = parse_args()
-    store = KVStore(args.request_window_size)
-
-    try:
-        TCPKVServer(args.host, args.port, store).serve_forever()
-    except KeyboardInterrupt:
-        print("\nKV server stopped")
-
-
-if __name__ == "__main__":
-    main()
+    def shutdown(self) -> None:
+        """
+        Interrompe il server fluidamente.
+        Chiudendo il socket server si sblocca l'operazione .accept() in attesa nel ciclo principale.
+        """
+        self._is_running = False
+        if self._server_socket:
+            try:
+                self._server_socket.close()
+            except OSError:
+                pass

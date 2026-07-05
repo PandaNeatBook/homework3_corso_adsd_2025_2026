@@ -22,28 +22,25 @@ viene applicata allo store **al più una volta**, indipendentemente da quante
 volte il client invia la stessa richiesta con lo stesso `request_id` e
 stesso payload.
 
-**Perché vale.** Il lookup nella request table e l'applicazione dell'effetto
-allo store avvengono dentro la stessa sezione critica (stesso lock). La
-sequenza è atomica rispetto a tutti gli altri thread:
+**Perché vale.** Il lookup nella request table e l'applicazione dell'effetto allo store sono protetti da una strategia di locking a grana fine a due livelli. I lock vengono acquisiti in un ordine rigoroso e gerarchico (prima il client, poi la chiave) per prevenire deadlock e garantire l'atomicità locale:
 
 ```
-1. Controlla request_table[(client_id, seq)]
-   → trovato: restituisci la risposta memorizzata (STOP, nessun effetto)
-2. Controlla eviction_boundary[client_id]
-   → seq <= boundary: ERR request_id_expired (STOP, nessun effetto)
-3. Applica l'effetto allo store
-4. Costruisci la risposta
-5. Salva (payload_canonico, risposta) in request_table
+1. Acquisizione del `client_lock` per il client_id specifico.
+2. Controlla request_table[(client_id, seq)]
+   → trovato: restituisci la risposta memorizzata (STOP, nessun effetto).
+3. Controlla eviction_boundary[client_id]
+   → seq <= boundary: ERR request_id_expired (STOP, nessun effetto).
+4. Acquisizione del `key_lock` specifico per la chiave.
+5. Acquisizione del `store_structure_lock` (solo se l'operazione altera la struttura globale del dizionario).
+6. Applica l'effetto allo store e calcola la nuova versione.
+7. Rilascio del `store_structure_lock` e del `key_lock`.
+8. Costruisci e salva (payload_canonico, risposta) in request_table.
+9. Rilascio del `client_lock`.
 ```
 
-Poiché i passi 1–5 sono atomici, due thread che ricevono lo stesso
-`request_id` contemporaneamente si serializzano: il secondo trova già la
-voce in tabella e restituisce la risposta cached senza toccare lo store.
+Poiché il controllo iniziale (2) e il salvataggio finale (8) avvengono sotto lo stesso client_lock, due thread che ricevono lo stesso request_id contemporaneamente si serializzano alla radice: il secondo trova già la voce in tabella e restituisce la risposta cached senza toccare lo store o acquisire lock aggiuntivi.
 
-**Cosa potrebbe violarla.** Se il lock non coprisse l'intera sequenza 1–5,
-due thread potrebbero superare entrambi il controllo al passo 1 e applicare
-l'effetto due volte. Questa violazione non è possibile nell'implementazione
-corretta.
+**Cosa potrebbe violarla.** Se il client_lock non coprisse sia la fase di check iniziale che quella di salvataggio in cache, due thread potrebbero superare entrambi il controllo e acquisire in sequenza il key_lock, applicando l'effetto due volte. Inoltre, se l'ordine di acquisizione dei lock (client -> chiave) non fosse strettamente rispettato, si verificherebbero dei deadlock.
 
 ---
 
@@ -61,15 +58,9 @@ applicazione. In particolare:
 - se la prima esecuzione ha prodotto `NOT_FOUND` (su un `DELETE_REQ`
   di chiave assente), il retry riceve `NOT_FOUND`.
 
-**Perché vale.** La risposta viene salvata nella request table **dopo** che
-l'effetto è stato applicato e **prima** che venga inviata al client (passi
-4→5→6). Non esiste finestra temporale tra la modifica dello store e la
-memorizzazione della risposta: i due passi sono dentro lo stesso lock.
-Qualunque retry successivo trova la risposta già in tabella.
+**Perché vale.** La risposta viene salvata nella request table dopo che l'effetto è stato applicato allo store, ma prima che il client_lock venga rilasciato. Non esiste finestra temporale in cui un altro thread associato allo stesso client_id possa intromettersi tra la modifica dello store e la memorizzazione della risposta. Qualunque retry successivo si metterà in coda sul client_lock e troverà la risposta già in tabella.
 
-**Cosa potrebbe violarla.** Inviare la risposta al client prima di salvarla
-in tabella aprirebbe una finestra in cui un retry potrebbe essere trattato
-come prima esecuzione. Questa inversione è espressamente vietata dal design.
+**Cosa potrebbe violarla.** Inviare la risposta al client o rilasciare il client_lock prima di salvarla in tabella aprirebbe una finestra in cui un retry concorrente potrebbe essere trattato come prima esecuzione. Questa inversione è espressamente vietata dal design.
 
 ---
 
@@ -239,6 +230,16 @@ Non ci sono attese su risorse esterne, consenso distribuito o retry automatici i
 
 ---
 
+### L5 — Operazioni concorrenti non creano colli di bottiglia globali (Liveness dei Lock)
+
+**Proprietà.** Richieste inviate da client diversi, o dirette verso chiavi diverse da client diversi, procedono in pieno parallelismo senza bloccarsi a vicenda.
+
+**Perché vale.** Il sistema non utilizza un singolo lock globale transazionale, ma delega il blocco a una strategia a grana fine (_client_locks e _key_locks). Il lock globale (_meta_lock) viene trattenuto per un tempo microscopico, solo per allocare e recuperare l'oggetto lock dal dizionario. Di conseguenza:
+- Due client che operano in simultanea su chiavi diverse non subiscono alcuna contesa di blocco (liveness massima).
+- Due client che operano sulla stessa chiave competono solo sull'acquisizione del key_lock, per il tempo strettamente necessario a calcolare la nuova versione.
+
+**Cosa potrebbe violarla.** L'uso di un singolo lock globale per l'intera sequenza di lookup, validazione, scrittura e cache azzererebbe il parallelismo, costringendo tutti i client a mettersi in fila indiana per accedere al database (violazione della liveness prestazionale sotto stress).
+
 ## Limiti dichiarati
 
 ### Nessuna persistenza
@@ -246,43 +247,6 @@ Non ci sono attese su risorse esterne, consenso distribuito o retry automatici i
 Store e request table sono solo in memoria. Dopo un riavvio, il server perde sia i dati sia le risposte cached.
 
 Conseguenza: un retry precedente al riavvio può essere trattato come prima esecuzione.
-
----
-
-### L'idempotenza non sopravvive al failover Primary→Secondary
-
-**Proprietà (limite dichiarato).** Se il Primary crasha e il Secondary si
-promuove a nuovo Primary, la request table del nuovo Primary è **vuota**.
-Un retry inviato dal client al nuovo Primary viene trattato come prima
-esecuzione, con rischio di doppio effetto.
-
-**Perché accade.** La request table è mantenuta esclusivamente in memoria
-locale del nodo che riceve la richiesta. Il meccanismo di replicazione
-trasferisce al Secondary solo gli effetti applicati allo store (le coppie
-chiave/valore), ma non le voci della request table. Il Secondary non ha
-modo di sapere quali `(client_id, seq)` il Primary aveva già elaborato.
-
-Questo implica che la sequenza:
-
-```
-1. Client invia  SET_REQ clientA:42 corso val  → Primary risponde OK v=3
-2. La risposta va persa (timeout / disconnessione)
-3. Primary crasha → Secondary si promuove a Primary
-4. Client fa retry: SET_REQ clientA:42 corso val
-5. Nuovo Primary non ha la request table → applica l'effetto di nuovo
-                                            → DOPPIO EFFETTO ❌
-```
-
-non è prevenuta dall'implementazione corrente.
-
-**Cosa servirebbe per garantirla.** Eliminare questa limitazione richiederebbe:
-
-1. **Replicare la request table**: ogni voce `(client_id, seq) → (payload, risposta)`
-   deve essere propagata al Secondary insieme all'effetto sullo store;
-2. **Replicazione sincrona**: il Primary deve rispondere `OK` al client solo dopo
-   che il Secondary ha confermato di aver persistito sia l'effetto che la voce
-   nella request table. La replicazione asincrona non è sufficiente perché
-   lascia aperta la stessa finestra di rischio.
 
 ---
 
