@@ -1,4 +1,3 @@
-```markdown
 # Proprietà di Safety e Liveness: Router, Idempotenza e Rebalancing
 
 Questo documento descrive le proprietà di correttezza architetturale del progetto **KV Store Distribuito con Gateway (Router), Rebalancing e Retry Idempotenti**.
