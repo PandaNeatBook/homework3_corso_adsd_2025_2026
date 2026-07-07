@@ -18,8 +18,8 @@ rendendo il test rapido, deterministico e indipendente dai socket.
 
 from __future__ import annotations
 
-from protocol_common import ShardRef
-from router import Router
+from src.protocol_common import ShardRef
+from src.router import Router
 
 
 class MockedRouter(Router):
