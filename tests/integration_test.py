@@ -79,7 +79,7 @@ def cluster_setup():
 
 # --- TEST CASES ---
 
-def test_router_coordinator_shardnode_integration(cluster_setup):
+def test_router_coordinator_shardnode_integration(cluster_setup, monkeypatch):
     router_public_port = cluster_setup["router_public"]
     shard_ports = cluster_setup["shard_ports"]
 
@@ -133,6 +133,17 @@ def test_router_coordinator_shardnode_integration(cluster_setup):
     # ------------------------------------------------------------------
     # Fase 4: rebalance verso 3 shard, con verifica di lettura continua
     # ------------------------------------------------------------------
+
+    # Rallentiamo il Coordinator per assicurarci di intercettare il rebalancing
+    from src.coordinator import Coordinator
+    original_set = Coordinator._shard_set
+
+    def slow_shard_set(shard, key, version, value):
+        time.sleep(0.02)  # 20ms di ritardo intenzionale per chiave
+        return original_set(shard, key, version, value)
+
+    monkeypatch.setattr(Coordinator, "_shard_set", staticmethod(slow_shard_set))
+
     resp = rpc(router_public_port, f"ADD_SHARD shard-3 {HOST}:{shard_ports['shard-3']}")
     assert resp == "OK", "ADD_SHARD shard-3 fallito"
 
