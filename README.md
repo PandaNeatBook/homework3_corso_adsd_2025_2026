@@ -10,6 +10,43 @@ La soluzione si basa sull'identificatore univoco (`request_id`). Il **Router** g
 
 ---
 
+## Struttura del repository
+
+```text
+.
+├── src/
+│   ├── router.py
+│   ├── coordinator.py
+│   ├── shard_node.py
+│   ├── client.py
+│   └── protocol_common.py
+│
+├── tests/
+│   ├── acceptance_test.py
+│   └── integration_test.py
+│
+├── docs/
+│   ├── api-contract.md
+│   ├── homework_3.md
+│   ├── SAFETY_LIVENESS.md
+│   ├── TECHNICAL_NOTE.md
+│   └── Presentazione/
+│       └── Presentazione_Finale.pptx
+│
+├── archive/
+│   └── course_materials/
+│       ├── labs/
+│       └── lessons/
+│
+├── requirements.txt
+├── pytest.ini
+└── README.md
+```
+
+Il codice principale del progetto è contenuto in `src/`. I test automatici sono in `tests/`. La documentazione tecnica e la traccia sono in `docs/`. La presentazione finale è in `docs/Presentazione/`. Il materiale didattico del corso è stato spostato in `archive/course_materials/`, così resta disponibile ma separato dal codice del progetto.
+
+---
+
 ## Trasporto
 
 - Protocollo testuale su TCP.
@@ -36,11 +73,8 @@ Il `request_id` identifica univocamente una singola operazione mutativa emessa d
 
 Formato:
 
-
-```
-
+```text
 <client_id>:<seq>
-
 ```
 
 Dove:
@@ -74,11 +108,11 @@ Se il comando è ben formato, il Router garantisce l'atomicità tramite un lock 
 3. Se `seq <= eviction_boundary[client_id]`:
    - restituisce `ERR_REQUEST_ID_EXPIRED` (**STOP**).
 4. Altrimenti (prima esecuzione):
-   - Fotografa la topologia attiva senza bloccare la rete (`_routing_snapshot`).
-   - Se l'operazione è `CAS_REQ` e c'è un rebalance in corso, restituisce `ERR_REBALANCING` (**STOP, non salva in cache**).
-   - Calcola il nuovo Sequence Number globale (`_version_lock`).
-   - Esegue la chiamata di rete TCP verso lo ShardNode di destinazione.
-   - Salva la tupla `(payload_canonico, risposta_dello_shard)` nella request table.
+   - fotografa la topologia attiva senza bloccare la rete (`_routing_snapshot`);
+   - se l'operazione è `CAS_REQ` e c'è un rebalance in corso, restituisce `ERR_REBALANCING` (**STOP, non salva in cache**);
+   - calcola il nuovo Sequence Number globale (`_version_lock`);
+   - esegue la chiamata di rete TCP verso lo ShardNode di destinazione;
+   - salva la tupla `(payload_canonico, risposta_dello_shard)` nella request table.
 5. Rilascia il `client_lock` e invia la risposta al client.
 
 L'atomicità nel `client_lock` fa sì che due thread con lo stesso `request_id` si accodino sul Router: il secondo thread troverà la risposta in cache e non farà mai una chiamata di rete duplicata.
@@ -88,24 +122,30 @@ L'atomicità nel `client_lock` fa sì che due thread con lo stesso `request_id` 
 ## Comandi mutativi (con request_id)
 
 ### `SET_REQ <client_id>:<seq> <key> <value...>`
+
 Crea o sovrascrive `key` con `value`. Durante un rebalance viene instradata direttamente alla topologia nuova.
+
 - Risposte possibili: `OK version=<n>`
 - Retry con payload diverso: `ERR_REQUEST_ID_CONFLICT`
 
 ### `CAS_REQ <client_id>:<seq> <key> <expected_version> <value...>`
+
 Aggiorna `key` solo se la versione corrente è `expected_version`. **Bloccata durante il rebalance**.
+
 - Risposte possibili: `OK version=<n>`, `ERR_CAS_CONFLICT current=<m>`, `ERR_NOT_FOUND`
-- Risposta transitoria (durante rebalance): `ERR_REBALANCING`
+- Risposta transitoria durante rebalance: `ERR_REBALANCING`
 
 ### `DELETE_REQ <client_id>:<seq> <key>`
+
 Se la chiave esiste, la maschera scrivendo il valore `<TOMBSTONE>` con una nuova versione globale.
+
 - Risposte possibili: `OK`, `ERR_NOT_FOUND`
 
 ---
 
 ## Comandi di lettura e monitoraggio (senza request_id)
 
-Durante un rebalance, le letture usano un meccanismo di **fallback**: interrogano la topologia nuova, e se la chiave non c'è (e non è un Tombstone), interrogano quella vecchia.
+Durante un rebalance, le letture usano un meccanismo di **fallback**: interrogano la topologia nuova e, se la chiave non c'è e non è un Tombstone, interrogano quella vecchia.
 
 | Comando | Risposta |
 |---|---|
@@ -126,23 +166,24 @@ Comandi per modificare dinamicamente il cluster:
 |---|---|
 | `ADD_SHARD <id> <host:port>` | Prepara l'aggiunta di un nodo. |
 | `REMOVE_SHARD <id> <host:port>` | Prepara la rimozione di un nodo attivo. |
-| `REBALANCE` | Avvia la migrazione asincrona 2PC (Two-Phase Commit) tramite il Coordinator. |
+| `REBALANCE` | Avvia una migrazione asincrona gestita dal Coordinator, basata su una procedura semplificata copy-commit-cleanup ispirata alla Two-Phase Commit. |
 
 ---
 
 ## Garbage Collection della request table
 
 ### Sliding window
-Il Router conserva al più `N` voci recenti (ordinamento per `seq`) per ogni `client_id`. L'eviction elimina la voce con il `seq` più basso. Costo: O(1) inline. Parametro configurabile (default: `100`).
+
+Il Router conserva al più `N` voci recenti per ogni `client_id`, ordinate logicamente per `seq`. Quando la finestra supera la dimensione massima, viene rimossa una richiesta vecchia e viene aggiornato il limite inferiore di validità dei retry. Parametro configurabile: default `100`.
 
 ### Eviction boundary (low-watermark)
+
 Quando una voce viene scartata, si aggiorna:
 
-```
-
+```text
 eviction_boundary[client_id] = max(eviction_boundary[client_id], seq_evictato)
-
 ```
+
 Se un retry ha `seq <= eviction_boundary`, il Router risponde `ERR_REQUEST_ID_EXPIRED`.
 
 ---
@@ -150,26 +191,51 @@ Se un retry ha `seq <= eviction_boundary`, il Router risponde `ERR_REQUEST_ID_EX
 ## Sicurezza e Progresso in Sintesi
 
 - **Nessun doppio effetto di rete.** L'acquisizione serializzata sul Router previene doppi invii agli ShardNode.
-- **Isolamento e Parallismo.** L'accesso al Router serializza solo lo *stesso* client. Client diversi viaggiano in parallelo verso shard diversi.
+- **Isolamento e Parallelismo.** L'accesso al Router serializza solo lo *stesso* client. Client diversi viaggiano in parallelo verso shard diversi.
 - **Prevenzione Zombie.** I tombstone evitano letture di dati obsoleti durante il fallback di migrazione.
-- **Fail-safe Rebalance.** Una Two-Phase Commit e un Watchdog evitano blocchi e perdite di dati se il Coordinator fallisce.
+- **Fail-safe Rebalance.** La procedura copy-commit-cleanup e il Watchdog riducono il rischio di blocchi e perdita di dati se il Coordinator fallisce durante la migrazione.
 
 ---
 
-## Test di Integrazione (`integration_test.py`)
+## Test
 
-Oltre ai vecchi unit test, la suite esegue l'intera architettura (Router, Coordinator, 3 ShardNode) in processi leggeri simulando socket TCP reali.
+La suite comprende test di accettazione sul Router e test di integrazione sull'intera architettura distribuita.
 
-### Scenari testati:
-1. **Bootstrap Topologia:** Avvio con 2 shard tramite `ADD_SHARD` e `REBALANCE`.
-2. **Idempotenza di Base:** Scritture concorrenti (SET, CAS), verifica di cache miss/hit, rilevamento conflitti di payload.
-3. **Rebalance e Fallback:** Aggiunta a caldo del 3° shard. Il test verifica che le GET continuino a funzionare (read-fallback), le CAS vengano rifiutate transitoriamente (`ERR_REBALANCING`), e le SET vadano a buon fine incrementando il contatore globale.
-4. **Tombstone Cleanup:** Test della `DELETE_REQ` che genera il Tombstone, nasconde la chiave dalla `GET` e `KEYS`, con successiva verifica di pulizia asincrona.
+### Test di accettazione
 
-Per eseguirlo:
+I test in `tests/acceptance_test.py` verificano il contratto principale del Router:
+
+- retry idempotenti;
+- replay della stessa risposta;
+- conflitto di payload con stesso `request_id`;
+- eviction della request table;
+- gestione di `DELETE_REQ`;
+- errori di protocollo.
+
+### Test di integrazione
+
+I test in `tests/integration_test.py` eseguono l'intera architettura (Router, Coordinator e 3 ShardNode) simulando socket TCP reali.
+
+Scenari testati:
+
+1. **Bootstrap Topologia:** avvio con 2 shard tramite `ADD_SHARD` e `REBALANCE`.
+2. **Idempotenza di Base:** scritture, retry, cache hit, rilevamento conflitti di payload.
+3. **CAS:** aggiornamento condizionato su versione e replay idempotente dell'esito.
+4. **Rebalance e Fallback:** aggiunta a caldo del 3° shard, letture continue durante la migrazione, blocco transitorio delle `CAS_REQ`.
+5. **Tombstone Cleanup:** `DELETE_REQ`, mascheramento della chiave cancellata e verifica che `KEYS` non mostri i tombstone.
+6. **Idempotenza dopo Rebalance:** verifica che un retry vecchio continui a ricevere la risposta cached anche dopo un cambio di topologia.
+
+Per installare le dipendenze ed eseguire tutti i test:
+
 ```bash
-pytest integration_test.py -v
+python -m pip install -r requirements.txt
+python -m pytest -q
+```
 
+Per eseguire solo il test di integrazione:
+
+```bash
+python -m pytest tests/integration_test.py -v
 ```
 
 ---
@@ -188,4 +254,3 @@ pytest integration_test.py -v
 | `ERR shard_unreachable: <exc>` | Lo ShardNode interno non è raggiungibile via rete dal Router |
 | `ERR usage: ...` | Argomenti mancanti o malformati |
 | `ERR bad_version` | `CAS_REQ` con versione non intera |
-
