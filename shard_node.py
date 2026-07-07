@@ -40,28 +40,55 @@ from protocol_common import TOMBSTONE, LineTCPServer
 
 @dataclass
 class StoredValue:
+    """Rappresenta un singolo record memorizzato nel database."""
     value: str
     version: int
 
 
 class ShardStore:
-    """Store in-memory thread-safe di un singolo shard."""
+    """
+    Store in-memory thread-safe di un singolo shard.
+
+    Adotta una strategia di locking a grana fine (fine-grained locking) per
+    massimizzare le performance: le operazioni su chiavi diverse possono
+    avvenire in parallelo senza bloccarsi a vicenda.
+    """
 
     def __init__(self) -> None:
+        # Struttura dati principale: mappa la chiave al suo valore e versione.
         self._data: dict[str, StoredValue] = {}
+
+        # Lock di servizio usato ESCLUSIVAMENTE per proteggere la creazione
+        # lazy (su richiesta) dei lock specifici per chiave all'interno del
+        # dizionario _key_locks.
         self._meta_lock = threading.Lock()
+
+        # Dizionario di lock specifici per chiave. Permette a due thread di
+        # scrivere contemporaneamente su "chiave_A" e "chiave_B" in totale parallelismo.
         self._key_locks: dict[str, threading.Lock] = {}
-        # Protegge le operazioni che iterano l'intero dizionario (SHARD_GET_ALL,
-        # SHARD_CLEANUP_TOMBSTONES) da mutazioni concorrenti sulla struttura.
+
+        # Lock globale strutturale. In Python, iterare su un dizionario mentre
+        # un altro thread ne modifica la dimensione (aggiungendo o rimuovendo chiavi)
+        # lancia un RuntimeError. Questo lock protegge operazioni massive come
+        # SHARD_GET_ALL e SHARD_CLEANUP_TOMBSTONES dalle mutazioni concorrenti.
         self._structure_lock = threading.Lock()
 
     def _get_key_lock(self, key: str) -> threading.Lock:
+        """
+        Recupera il lock associato a una specifica chiave. Se non esiste,
+        lo istanzia al volo in modo thread-safe.
+        """
         with self._meta_lock:
             if key not in self._key_locks:
                 self._key_locks[key] = threading.Lock()
             return self._key_locks[key]
 
     def handle_line(self, line: str) -> str:
+        """
+        Entry-point per il protocollo TCP. Riceve una riga di testo, ne esegue
+        il parsing per estrarre il comando e gli argomenti, e la instrada
+        all'handler appropriato.
+        """
         stripped = line.strip()
         if not stripped:
             return "ERR empty_command"
@@ -72,25 +99,25 @@ class ShardStore:
 
         if cmd == "PING":
             return "OK PONG"
-
         if cmd == "SHARD_SET":
             return self._handle_set(args_str)
-
         if cmd == "SHARD_GET":
             return self._handle_get(args_str)
-
         if cmd == "SHARD_GET_ALL":
             return self._handle_get_all(args_str)
-
         if cmd == "SHARD_REMOVE_PHYSICAL":
             return self._handle_remove_physical(args_str)
-
         if cmd == "SHARD_CLEANUP_TOMBSTONES":
             return self._handle_cleanup_tombstones(args_str)
 
         return "ERR unknown_command"
 
     def _handle_set(self, args_str: str) -> str:
+        """
+        Core logic del Data Plane: esegue l'inserimento o l'aggiornamento di una chiave.
+        Implementa il contratto fondamentale del rebalancing: una scrittura è valida
+        SOLO SE la sua versione è maggiore di quella attualmente presente.
+        """
         tokens = args_str.split(maxsplit=2)
         if len(tokens) < 3:
             return "ERR usage: SHARD_SET <key> <version> <value...>"
@@ -100,22 +127,37 @@ class ShardStore:
         except ValueError:
             return "ERR bad_version"
 
+        # Acquisiamo prima il lock specifico per questa chiave, per evitare
+        # race condition se due client provano a scrivere la stessa chiave.
         key_lock = self._get_key_lock(key)
         with key_lock:
+            # Acquisiamo anche il lock strutturale. Perché? Perché se la chiave
+            # è nuova, stiamo per alterare la size del dizionario _data, il che
+            # potrebbe far crashare una SHARD_GET_ALL in esecuzione in parallelo.
             with self._structure_lock:
                 existing = self._data.get(key)
+
+                # Regola d'oro: scarta scritture con versione <= all'attuale.
+                # Questo risolve il problema delle migrazioni asincrone: se il
+                # Coordinator sta copiando un vecchio dato (v1) ma il client ha
+                # appena scritto un dato nuovo (v2) sul nuovo shard, quando il
+                # Coordinator tenta di scrivere la v1, lo shard la rifiuterà.
                 if existing is not None and version <= existing.version:
-                    # Scrittura obsoleta (es. migrazione in ritardo rispetto a
-                    # una scrittura piu' recente gia' arrivata sul nuovo shard):
-                    # viene scartata silenziosamente, come da contratto.
                     return "OK stale"
+
+                # Se passa il controllo, salviamo o sovrascriviamo il dato.
                 self._data[key] = StoredValue(value=value, version=version)
             return "OK stored"
 
     def _handle_get(self, args_str: str) -> str:
+        """
+        Esegue una lettura puntuale. Utilizza il lock di chiave per garantire
+        di non leggere un valore mentre viene sovrascritto a metà.
+        """
         key = args_str.strip()
         if not key or len(key.split()) != 1:
             return "ERR usage: SHARD_GET <key>"
+
         key_lock = self._get_key_lock(key)
         with key_lock:
             existing = self._data.get(key)
@@ -124,18 +166,35 @@ class ShardStore:
             return f"OK {existing.version} {existing.value}"
 
     def _handle_get_all(self, args_str: str) -> str:
+        """
+        Restituisce un dump completo del database.
+        Usato dal Coordinator durante un rebalance per migrare l'intero shard.
+        Acquisisce il _structure_lock per "congelare" lo stato del dizionario
+        ed evitare errori di mutazione durante l'iterazione.
+        """
         if args_str:
             return "ERR usage: SHARD_GET_ALL"
+
         with self._structure_lock:
+            # Crea un dizionario serializzabile in JSON.
             snapshot = {k: [v.value, v.version] for k, v in self._data.items()}
         return "OK " + json.dumps(snapshot)
 
     def _handle_remove_physical(self, args_str: str) -> str:
+        """
+        Elimina fisicamente (del) una chiave dal dizionario.
+        A differenza della DELETE logica dei client (che scrive un Tombstone),
+        questa funzione elimina davvero il record.
+        Potrebbe essere usata per operazioni di manutenzione a basso livello.
+        """
         key = args_str.strip()
         if not key or len(key.split()) != 1:
             return "ERR usage: SHARD_REMOVE_PHYSICAL <key>"
+
         key_lock = self._get_key_lock(key)
         with key_lock:
+            # Poiché modificheremo la dimensione del dizionario usando 'del',
+            # abbiamo bisogno del lock strutturale.
             with self._structure_lock:
                 if key in self._data:
                     del self._data[key]
@@ -143,14 +202,26 @@ class ShardStore:
                 return "OK absent"
 
     def _handle_cleanup_tombstones(self, args_str: str) -> str:
+        """
+        Garbage Collection dei valori cancellati logicamente.
+        Richiamato dal Router alla fine di un Rebalance, quando siamo sicuri
+        che i tombstone non servano più per il Read-Fallback.
+        """
         if args_str:
             return "ERR usage: SHARD_CLEANUP_TOMBSTONES"
+
         removed = 0
         with self._structure_lock:
+            # Step 1: Iteriamo e identifichiamo tutte le chiavi contrassegnate come TOMBSTONE.
+            # Creiamo una lista separata per le chiavi da rimuovere per evitare di
+            # modificare il dizionario mentre lo stiamo iterando.
             tombstoned_keys = [k for k, v in self._data.items() if v.value == TOMBSTONE]
+
+            # Step 2: Procediamo all'eliminazione fisica.
             for k in tombstoned_keys:
                 del self._data[k]
                 removed += 1
+
         return f"OK removed={removed}"
 
 
